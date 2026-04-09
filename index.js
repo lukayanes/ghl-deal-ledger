@@ -173,29 +173,50 @@ async function extractPdfText(base64Content) {
 
   const raw = new TextDecoder("latin1").decode(bytes);
   const allText = [];
-  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-  let match;
 
-  while ((match = streamRegex.exec(raw)) !== null) {
+  // Use indexOf instead of regex to find stream boundaries — much faster on large binary data
+  let pos = 0;
+  while (pos < raw.length) {
+    // Find the start of a stream block
+    let streamMarker = raw.indexOf("stream\r\n", pos);
+    let markerLen = 8;
+    if (streamMarker === -1) {
+      streamMarker = raw.indexOf("stream\n", pos);
+      markerLen = 7;
+    }
+    if (streamMarker === -1) break;
+
+    const dataStart = streamMarker + markerLen;
+
+    // Find the end of the stream block
+    let streamEnd = raw.indexOf("\r\nendstream", dataStart);
+    let endLen = 12;
+    if (streamEnd === -1) {
+      streamEnd = raw.indexOf("\nendstream", dataStart);
+      endLen = 10;
+    }
+    if (streamEnd === -1) break;
+
+    pos = streamEnd + endLen;
+
+    // Skip very small streams (metadata, not content)
+    const streamLen = streamEnd - dataStart;
+    if (streamLen < 10 || streamLen > 500000) continue;
+
     try {
-      const streamBytes = new Uint8Array(match[1].length);
-      for (let i = 0; i < match[1].length; i++) {
-        streamBytes[i] = match[1].charCodeAt(i);
+      const streamData = raw.slice(dataStart, streamEnd);
+      const streamBytes = new Uint8Array(streamLen);
+      for (let i = 0; i < streamLen; i++) {
+        streamBytes[i] = streamData.charCodeAt(i);
       }
 
-      let decompressed = await decompress(streamBytes);
-      let streamText;
-
-      if (decompressed) {
-        streamText = new TextDecoder("latin1").decode(decompressed);
-      } else {
-        streamText = match[1];
-      }
+      const decompressed = await decompress(streamBytes);
+      const streamText = decompressed
+        ? new TextDecoder("latin1").decode(decompressed)
+        : streamData;
 
       const text = extractTextFromStream(streamText);
-      if (text.trim()) {
-        allText.push(text);
-      }
+      if (text.trim()) allText.push(text);
     } catch (_) {}
   }
 
