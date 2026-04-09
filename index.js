@@ -58,13 +58,15 @@ async function graphGet(token, url) {
   return res.json();
 }
 
-async function graphPost(token, url, body) {
+async function graphPost(token, url, body, extraHeaders) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -399,7 +401,20 @@ async function processSigningEmails(env) {
   console.log("Found " + emails.length + " signing email(s) with attachments.");
 
   const siteUrl = "https://graph.microsoft.com/v1.0/sites/" + env.SHAREPOINT_SITE_ID;
-  const worksheetUrl = siteUrl + "/drive/root:/" + env.LEDGER_FILE_PATH + ":/workbook/worksheets('" + (env.LEDGER_SHEET_NAME || "Sheet1") + "')";
+  const workbookUrl = siteUrl + "/drive/root:/" + env.LEDGER_FILE_PATH + ":/workbook";
+  const worksheetUrl = workbookUrl + "/worksheets('" + (env.LEDGER_SHEET_NAME || "Sheet1") + "')";
+
+  // Create a workbook session — this forces through stale editing locks
+  let sessionId = null;
+  try {
+    const session = await graphPost(token, workbookUrl + "/createSession", { persistChanges: true });
+    sessionId = session.id;
+    console.log("Workbook session created: " + sessionId);
+  } catch (err) {
+    console.error("Failed to create workbook session: " + err.message);
+    // Continue without session — might work if the file is unlocked
+  }
+  const sessionHeaders = sessionId ? { "workbook-session-id": sessionId } : {};
 
   let processedCount = 0;
   let latestTimestamp = lastProcessed;
@@ -473,7 +488,7 @@ async function processSigningEmails(env) {
       const insertUrl = worksheetUrl + "/tables('" + tableName + "')/rows";
       emailDebug.insertUrl = insertUrl;
 
-      await graphPost(token, insertUrl, { index: 0, values: rowValues });
+      await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
 
       emailDebug.status = "success";
       console.log("Inserted: " + deal.propertyAddress + " (" + deal.strategy + ") - " + deal.contractPrice);
@@ -490,6 +505,22 @@ async function processSigningEmails(env) {
       console.error("Error processing email " + email.id + ": " + err.message);
     }
     debugLog.push(emailDebug);
+  }
+
+  // Close the workbook session to release the lock
+  if (sessionId) {
+    try {
+      await fetch(workbookUrl + "/closeSession", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "workbook-session-id": sessionId,
+        },
+        body: "{}",
+      });
+      console.log("Workbook session closed.");
+    } catch (_) {}
   }
 
   if (latestTimestamp !== lastProcessed) {
