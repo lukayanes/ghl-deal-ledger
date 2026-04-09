@@ -77,29 +77,29 @@ async function graphPost(token, url, body) {
 // ─── PDF Text Extraction (no dependencies) ───────────────────────────────────
 
 async function decompress(data) {
-  // PDF FlateDecode is always zlib (deflate with header) — skip the "raw" fallback
-  // to cut CPU cost in half when streams fail to decompress.
-  try {
-    const ds = new DecompressionStream("deflate");
-    const writer = ds.writable.getWriter();
-    const reader = ds.readable.getReader();
-    writer.write(data);
-    writer.close();
-    const chunks = [];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-    let totalLen = 0;
-    for (const c of chunks) totalLen += c.length;
-    const result = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const c of chunks) { result.set(c, offset); offset += c.length; }
-    return result;
-  } catch (_) {
-    return null;
+  // Try zlib (standard PDF FlateDecode), then raw deflate as fallback
+  for (const fmt of ["deflate", "deflate-raw"]) {
+    try {
+      const ds = new DecompressionStream(fmt);
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      writer.write(data);
+      writer.close();
+      const chunks = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      let totalLen = 0;
+      for (const c of chunks) totalLen += c.length;
+      const result = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const c of chunks) { result.set(c, offset); offset += c.length; }
+      return result;
+    } catch (_) { continue; }
   }
+  return null;
 }
 
 function decodePdfString(s) {
@@ -161,18 +161,16 @@ function extractTextFromStream(streamText) {
 }
 
 async function extractPdfText(base64Content) {
-  // Decode up to ~150 KB of raw PDF. Contract text lives in the first 1-2 pages;
-  // the rest of the file is embedded signature images with no parseable text.
-  // We stop early once we have enough text, so CPU usage stays low.
-  const safeBase64 = base64Content.slice(0, Math.floor(200000 / 4) * 4);
-  const binaryString = atob(safeBase64);
-  const bytes = Uint8Array.from(binaryString, (c) => c.charCodeAt(0));
-  const raw = new TextDecoder("latin1").decode(bytes);
+  // atob produces a binary string — scanning it with indexOf is native and fast.
+  // We avoid building a Uint8Array of the full PDF (which requires a slow
+  // per-byte JS loop). Instead we only convert individual stream slices,
+  // which are small (< 100 KB each).
+  const raw = atob(base64Content);
   const allText = [];
 
   let pos = 0;
   let streamCount = 0;
-  const MAX_STREAMS = 40;
+  const MAX_STREAMS = 20; // hard cap on decompression attempts
 
   while (pos < raw.length && streamCount < MAX_STREAMS) {
     let streamMarker = raw.indexOf("stream\r\n", pos);
@@ -196,13 +194,14 @@ async function extractPdfText(base64Content) {
     pos = streamEnd + endLen;
     streamCount++;
 
-    // Text streams for a contract page are typically 2–20 KB compressed.
-    // Skip tiny (metadata/font) and huge (image) streams.
+    // Skip tiny streams (font/metadata tokens) and enormous ones (JPEG images).
+    // Contract text streams in GHL PDFs are typically 10 KB – 150 KB compressed.
     const streamLen = streamEnd - dataStart;
-    if (streamLen < 10 || streamLen > 20000) continue;
+    if (streamLen < 100 || streamLen > 150000) continue;
 
     try {
       const streamData = raw.slice(dataStart, streamEnd);
+      // Convert only this slice to bytes — much cheaper than doing the full PDF
       const streamBytes = Uint8Array.from(streamData, (c) => c.charCodeAt(0));
       const decompressed = await decompress(streamBytes);
       const streamText = decompressed
@@ -213,9 +212,8 @@ async function extractPdfText(base64Content) {
       if (text.trim()) allText.push(text);
     } catch (_) {}
 
-    // Early exit: once we have 2000+ chars we have more than enough to parse
-    const totalSoFar = allText.join("").length;
-    if (totalSoFar > 2000) break;
+    // Early exit once we have enough text to parse all contract fields
+    if (allText.join("").length > 2000) break;
   }
 
   return allText.join(" ").replace(/\s+/g, " ").trim();
