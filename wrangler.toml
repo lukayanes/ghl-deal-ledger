@@ -1,0 +1,26 @@
+name = "ghl-deal-ledger"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+node_compat = true
+
+# Runs every 5 minutes
+[triggers]
+crons = ["*/5 * * * *"]
+
+# KV namespace binding — replace <YOUR_KV_NAMESPACE_ID> after creating it
+[[kv_namespaces]]
+binding = "GHL_KV"
+id = "<YOUR_KV_NAMESPACE_ID>"
+
+# All secrets are set via `wrangler secret put <NAME>` — do NOT put them here.
+# Required secrets:
+#   AZURE_TENANT_ID
+#   AZURE_CLIENT_ID
+#   AZURE_CLIENT_SECRET
+#   TARGET_MAILBOX            (e.g. aubrey@summitgroupacq.com)
+#   SHAREPOINT_SITE_ID        (e.g. summitgroupacq.sharepoint.com,<guid>,<guid>)
+#   LEDGER_FILE_PATH          (e.g. Documents/Deal Ledger.xlsx)
+#   LEDGER_SHEET_NAME         (e.g. Sheet1)
+#   LEDGER_TABLE_NAME         (e.g. DealLedger)
+#   WORKER_SECRET             (optional — protects the /run endpoint)
