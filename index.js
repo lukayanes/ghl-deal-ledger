@@ -161,11 +161,10 @@ function extractTextFromStream(streamText) {
 }
 
 async function extractPdfText(base64Content) {
-  // Only decode the first ~60 KB of raw PDF bytes.
-  // Contract text is always in the first 1-2 pages; everything after that is
-  // embedded signature images that contain no parseable text and are the
-  // primary cause of CPU limit errors.
-  const safeBase64 = base64Content.slice(0, Math.floor(80000 / 4) * 4);
+  // Decode up to ~150 KB of raw PDF. Contract text lives in the first 1-2 pages;
+  // the rest of the file is embedded signature images with no parseable text.
+  // We stop early once we have enough text, so CPU usage stays low.
+  const safeBase64 = base64Content.slice(0, Math.floor(200000 / 4) * 4);
   const binaryString = atob(safeBase64);
   const bytes = Uint8Array.from(binaryString, (c) => c.charCodeAt(0));
   const raw = new TextDecoder("latin1").decode(bytes);
@@ -173,7 +172,7 @@ async function extractPdfText(base64Content) {
 
   let pos = 0;
   let streamCount = 0;
-  const MAX_STREAMS = 30; // hard cap so we never loop forever
+  const MAX_STREAMS = 40;
 
   while (pos < raw.length && streamCount < MAX_STREAMS) {
     let streamMarker = raw.indexOf("stream\r\n", pos);
@@ -197,10 +196,10 @@ async function extractPdfText(base64Content) {
     pos = streamEnd + endLen;
     streamCount++;
 
-    // Skip tiny streams (metadata/fonts) and very large ones (embedded images).
-    // Text streams for a typical contract page are 2–25 KB compressed.
+    // Text streams for a contract page are typically 2–20 KB compressed.
+    // Skip tiny (metadata/font) and huge (image) streams.
     const streamLen = streamEnd - dataStart;
-    if (streamLen < 10 || streamLen > 25000) continue;
+    if (streamLen < 10 || streamLen > 20000) continue;
 
     try {
       const streamData = raw.slice(dataStart, streamEnd);
@@ -213,6 +212,10 @@ async function extractPdfText(base64Content) {
       const text = extractTextFromStream(streamText);
       if (text.trim()) allText.push(text);
     } catch (_) {}
+
+    // Early exit: once we have 2000+ chars we have more than enough to parse
+    const totalSoFar = allText.join("").length;
+    if (totalSoFar > 2000) break;
   }
 
   return allText.join(" ").replace(/\s+/g, " ").trim();
