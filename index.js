@@ -77,33 +77,29 @@ async function graphPost(token, url, body) {
 // ─── PDF Text Extraction (no dependencies) ───────────────────────────────────
 
 async function decompress(data) {
-  for (const format of ["deflate", "raw"]) {
-    try {
-      const ds = new DecompressionStream(format);
-      const writer = ds.writable.getWriter();
-      const reader = ds.readable.getReader();
-      writer.write(data);
-      writer.close();
-      const chunks = [];
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-      let totalLen = 0;
-      for (const c of chunks) totalLen += c.length;
-      const result = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const c of chunks) {
-        result.set(c, offset);
-        offset += c.length;
-      }
-      return result;
-    } catch (_) {
-      continue;
+  // PDF FlateDecode is always zlib (deflate with header) — skip the "raw" fallback
+  // to cut CPU cost in half when streams fail to decompress.
+  try {
+    const ds = new DecompressionStream("deflate");
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    writer.write(data);
+    writer.close();
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
     }
+    let totalLen = 0;
+    for (const c of chunks) totalLen += c.length;
+    const result = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const c of chunks) { result.set(c, offset); offset += c.length; }
+    return result;
+  } catch (_) {
+    return null;
   }
-  return null;
 }
 
 function decodePdfString(s) {
@@ -165,20 +161,21 @@ function extractTextFromStream(streamText) {
 }
 
 async function extractPdfText(base64Content) {
-  // Only decode the first 180KB of the PDF — contract text is always in the first
-  // 1-2 pages. The rest is embedded signature images that inflate the file but
-  // contain no parseable text, and are what causes CPU limit errors.
-  const safeBase64 = base64Content.slice(0, Math.floor(240000 / 4) * 4);
+  // Only decode the first ~60 KB of raw PDF bytes.
+  // Contract text is always in the first 1-2 pages; everything after that is
+  // embedded signature images that contain no parseable text and are the
+  // primary cause of CPU limit errors.
+  const safeBase64 = base64Content.slice(0, Math.floor(80000 / 4) * 4);
   const binaryString = atob(safeBase64);
-
-  // Use Uint8Array.from instead of a manual loop — significantly faster
   const bytes = Uint8Array.from(binaryString, (c) => c.charCodeAt(0));
   const raw = new TextDecoder("latin1").decode(bytes);
   const allText = [];
 
-  // Use indexOf to find stream boundaries — much faster than regex on binary data
   let pos = 0;
-  while (pos < raw.length) {
+  let streamCount = 0;
+  const MAX_STREAMS = 30; // hard cap so we never loop forever
+
+  while (pos < raw.length && streamCount < MAX_STREAMS) {
     let streamMarker = raw.indexOf("stream\r\n", pos);
     let markerLen = 8;
     if (streamMarker === -1) {
@@ -198,10 +195,12 @@ async function extractPdfText(base64Content) {
     if (streamEnd === -1) break;
 
     pos = streamEnd + endLen;
+    streamCount++;
 
-    // Skip tiny streams (metadata) and huge ones (images)
+    // Skip tiny streams (metadata/fonts) and very large ones (embedded images).
+    // Text streams for a typical contract page are 2–25 KB compressed.
     const streamLen = streamEnd - dataStart;
-    if (streamLen < 10 || streamLen > 80000) continue;
+    if (streamLen < 10 || streamLen > 25000) continue;
 
     try {
       const streamData = raw.slice(dataStart, streamEnd);
@@ -403,41 +402,79 @@ async function processSigningEmails(env) {
 
   let processedCount = 0;
   let latestTimestamp = lastProcessed;
+  const debugLog = [];
 
   for (const email of emails) {
     const emailKey = "processed_email_" + email.id;
     const alreadyDone = await env.GHL_KV.get(emailKey);
-    if (alreadyDone) continue;
+    if (alreadyDone) {
+      debugLog.push({ emailId: email.id, subject: email.subject, status: "skipped_already_done" });
+      continue;
+    }
 
+    const emailDebug = { emailId: email.id, subject: email.subject, status: "unknown" };
     try {
       const contractType = detectContractType(email.subject);
+      emailDebug.contractType = contractType;
       console.log("Processing: " + email.subject + " -> type: " + contractType);
 
-      const attUrl = "https://graph.microsoft.com/v1.0/users/" + userEmail + "/messages/" + email.id + "/attachments";
+      // Fetch attachment list first to get IDs
+      const attUrl = "https://graph.microsoft.com/v1.0/users/" + userEmail + "/messages/" + email.id + "/attachments?$select=id,name,size,contentType";
       const attachments = await graphGet(token, attUrl);
-      const pdfAtt = (attachments.value || []).find(function(a) {
-        return (a.name || "").toLowerCase().endsWith(".pdf") && a.contentBytes;
+      const attList = (attachments.value || []);
+      emailDebug.attachments = attList.map(function(a) { return { name: a.name, size: a.size, type: a.contentType }; });
+
+      // Find the PDF in the list
+      const pdfAttMeta = attList.find(function(a) {
+        return (a.name || "").toLowerCase().endsWith(".pdf") || (a.contentType || "").includes("pdf");
       });
 
-      if (!pdfAtt) {
-        console.log("No PDF attachment for email " + email.id + ", skipping.");
+      if (!pdfAttMeta) {
+        emailDebug.status = "no_pdf_attachment";
+        debugLog.push(emailDebug);
+        console.log("No PDF attachment for email " + email.id);
         continue;
       }
 
-      const pdfText = await extractPdfText(pdfAtt.contentBytes);
+      emailDebug.pdfName = pdfAttMeta.name;
+      emailDebug.pdfSize = pdfAttMeta.size;
+
+      // Fetch the full attachment content by ID (handles large files that omit contentBytes in list)
+      const fullAttUrl = "https://graph.microsoft.com/v1.0/users/" + userEmail + "/messages/" + email.id + "/attachments/" + pdfAttMeta.id;
+      const fullAtt = await graphGet(token, fullAttUrl);
+
+      if (!fullAtt.contentBytes) {
+        emailDebug.status = "no_content_bytes";
+        debugLog.push(emailDebug);
+        console.log("No contentBytes for attachment " + pdfAttMeta.id);
+        continue;
+      }
+
+      emailDebug.contentBytesLen = fullAtt.contentBytes.length;
+      const pdfText = await extractPdfText(fullAtt.contentBytes);
+      emailDebug.extractedChars = pdfText.length;
+      emailDebug.pdfSnippet = pdfText.slice(0, 200);
       console.log("Extracted " + pdfText.length + " chars from PDF.");
 
       let deal;
       if (contractType === "Novation" || pdfText.includes("CONTRACT FOR THE SALE & PURCHASE")) {
         deal = parseNovationContract(pdfText);
+        emailDebug.parsedType = "Novation";
       } else {
         deal = parseStandardContract(pdfText, contractType);
+        emailDebug.parsedType = deal.strategy;
       }
 
+      emailDebug.deal = { sellerName: deal.sellerName, address: deal.propertyAddress, price: deal.contractPrice, strategy: deal.strategy };
+
       const rowValues = dealToRow(deal);
-      const insertUrl = worksheetUrl + "/tables('" + (env.LEDGER_TABLE_NAME || "DealLedger") + "')/rows";
+      const tableName = env.LEDGER_TABLE_NAME || "DealLedger";
+      const insertUrl = worksheetUrl + "/tables('" + tableName + "')/rows";
+      emailDebug.insertUrl = insertUrl;
+
       await graphPost(token, insertUrl, { index: 0, values: rowValues });
 
+      emailDebug.status = "success";
       console.log("Inserted: " + deal.propertyAddress + " (" + deal.strategy + ") - " + deal.contractPrice);
 
       await env.GHL_KV.put(emailKey, "done", { expirationTtl: 90 * 24 * 60 * 60 });
@@ -447,15 +484,18 @@ async function processSigningEmails(env) {
         latestTimestamp = email.receivedDateTime;
       }
     } catch (err) {
+      emailDebug.status = "error";
+      emailDebug.error = err.message;
       console.error("Error processing email " + email.id + ": " + err.message);
     }
+    debugLog.push(emailDebug);
   }
 
   if (latestTimestamp !== lastProcessed) {
     await env.GHL_KV.put("last_processed_timestamp", latestTimestamp);
   }
 
-  return { processed: processedCount, total: emails.length };
+  return { processed: processedCount, total: emails.length, debug: debugLog };
 }
 
 // ─── Worker Entry Points ─────────────────────────────────────────────────────
