@@ -6,4 +6,7 @@ compatibility_date = "2024-09-01"
 [triggers]
 crons = ["*/5 * * * *"]
 
-
+# KV namespace binding — replace <YOUR_KV_NAMESPACE_ID> after creating it
+[[kv_namespaces]]
+binding = "GHL_KV"
+id = "<YOUR_KV_NAMESPACE_ID>"
