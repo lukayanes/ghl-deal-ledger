@@ -10,3 +10,10 @@ crons = ["*/5 * * * *"]
 [[kv_namespaces]]
 binding = "GHL_KV"
 id = "20940742c3494b98a8475665e12f63b1"
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
+[observability.traces]
+enabled = false
