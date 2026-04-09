@@ -2,7 +2,6 @@ name = "ghl-deal-ledger"
 main = "src/index.js"
 compatibility_date = "2024-09-01"
 compatibility_flags = ["nodejs_compat"]
-node_compat = true
 
 # Runs every 5 minutes
 [triggers]
