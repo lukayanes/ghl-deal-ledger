@@ -5,12 +5,6 @@
  * extracts deal data from the contact's custom fields, and inserts a
  * new row at row 4 (top of data) of the Summit Group Deal Ledger on SharePoint.
  *
- * Supports four deal types:
- *   - Novation
- *   - Cash
- *   - Sub-To
- *   - Seller Finance
- *
  * ZERO external dependencies — deploys as a single file.
  */
 
@@ -80,35 +74,70 @@ async function graphPost(token, url, body, extraHeaders) {
 // ─── Deal Type Detection ────────────────────────────────────────────────────
 
 function detectDealType(payload) {
-  // 1. Check explicit field if provided
   const explicit = (payload.deal_type || payload.dealType || "").toLowerCase();
   if (explicit.includes("novation")) return "Novation";
   if (explicit.includes("cash")) return "Cash";
-  if (explicit.includes("sub to") || explicit.includes("sub_to") || explicit.includes("subject to")) return "Sub-To";
+  if (explicit.includes("sub to") || explicit.includes("sub_to") || explicit.includes("sub-to") || explicit.includes("subject to") || explicit.includes("subject-to")) return "Subject-to";
   if (explicit.includes("seller finance") || explicit.includes("seller_finance")) return "Seller Finance";
 
-  // 2. Check document/workflow name if provided
   const docName = (payload.document_name || payload.workflow_name || payload.name || "").toLowerCase();
   if (docName.includes("novation")) return "Novation";
   if (docName.includes("cash")) return "Cash";
-  if (docName.includes("sub to") || docName.includes("sub_to") || docName.includes("subject to")) return "Sub-To";
+  if (docName.includes("sub to") || docName.includes("sub_to") || docName.includes("sub-to") || docName.includes("subject to") || docName.includes("subject-to")) return "Subject-to";
   if (docName.includes("seller finance") || docName.includes("seller_finance")) return "Seller Finance";
 
-  // 3. Detect from which custom fields are filled
-  if (payload.purchase_price_novation || payload.closing_date_novation || payload.emd_novation) {
-    return "Novation";
-  }
-  if (payload.purchase_price_cash || payload.closing_date_cash || payload.county_cash) {
-    return "Cash";
-  }
-  if (payload.seller_finance_terms) {
-    return "Seller Finance";
-  }
-  if (payload.existing_mortgage_balance || payload.monthly_mortgage_payment) {
-    return "Sub-To";
-  }
+  if (payload.purchase_price_novation || payload.closing_date_novation || payload.emd_novation) return "Novation";
+  if (payload.purchase_price_cash || payload.closing_date_cash || payload.county_cash) return "Cash";
+  if (payload.seller_finance_terms) return "Seller Finance";
+  if (payload.existing_mortgage_balance || payload.monthly_mortgage_payment) return "Subject-to";
 
   return "Unknown";
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function clean(val) {
+  if (val === null || val === undefined) return "";
+  const s = String(val).trim();
+  if (s === "null" || s === "undefined" || s === "") return "";
+  return s;
+}
+
+function formatMoney(val) {
+  if (!val) return "";
+  const s = String(val).replace(/[^0-9.]/g, "");
+  if (!s) return "";
+  const num = parseFloat(s);
+  if (isNaN(num)) return "";
+  return "$" + num.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+function excelSerialToDate(serial) {
+  return new Date((serial - 25569) * 86400 * 1000);
+}
+
+function parseAnyDate(val) {
+  const s = clean(val);
+  if (!s) return null;
+  const num = Number(s);
+  if (!isNaN(num) && num > 40000 && num < 60000) return excelSerialToDate(num);
+  const d = new Date(s);
+  if (!isNaN(d)) return d;
+  return null;
+}
+
+function formatDate(val) {
+  const d = parseAnyDate(val);
+  if (!d) return clean(val) || "";
+  return (d.getUTCMonth() + 1) + "/" + d.getUTCDate() + "/" + d.getUTCFullYear();
+}
+
+function formatMonthYear(val) {
+  const d = parseAnyDate(val);
+  if (!d) return "";
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  return mm + "/" + yy;
 }
 
 // ─── Extract Deal from Webhook Payload ──────────────────────────────────────
@@ -116,23 +145,32 @@ function detectDealType(payload) {
 function extractDeal(payload) {
   const dealType = detectDealType(payload);
 
-  // Seller name from standard contact fields
-  const firstName = payload.first_name || payload.firstName || payload.contact_first_name || "";
-  const lastName = payload.last_name || payload.lastName || payload.contact_last_name || "";
+  const firstName = clean(payload.first_name) || clean(payload.firstName) || clean(payload.contact_first_name);
+  const lastName = clean(payload.last_name) || clean(payload.lastName) || clean(payload.contact_last_name);
   const sellerName = (firstName + " " + lastName).trim();
 
-  // Property address
-  const fullAddress = payload.full_address_1 || "";
-  const street = payload.address1 || payload.street_address || "";
-  const city = payload.city || "";
-  const state = payload.state || "";
-  const zip = payload.postal_code || payload.zip || "";
+  const fullAddress = clean(payload.full_address_1);
+  const street = clean(payload.address1) || clean(payload.street_address);
+  const city = clean(payload.city);
+  const state = clean(payload.state);
+  const zip = clean(payload.postal_code) || clean(payload.zip);
   const propertyAddress = fullAddress || [street, city, state, zip].filter(Boolean).join(", ");
 
-  // Market (county or state)
-  const market = payload.county_cash || payload.county || state || "";
+  let cleanMarket = "";
+  if (dealType === "Cash") {
+    cleanMarket = state || clean(payload.county_cash) || "";
+  } else {
+    cleanMarket = clean(payload.county_cash) || clean(payload.county) || state || "";
+  }
+  if (!cleanMarket && fullAddress) {
+    const parts = fullAddress.split(",").map(function(s) { return s.trim(); });
+    if (parts.length >= 3) {
+      const stateZip = parts[parts.length - 1];
+      const stateMatch = stateZip.match(/^([A-Za-z\s]+)/);
+      if (stateMatch) cleanMarket = stateMatch[1].trim();
+    }
+  }
 
-  // Deal-type-specific fields
   let contractPrice = "";
   let closingDate = "";
   let underContractDate = "";
@@ -143,67 +181,65 @@ function extractDeal(payload) {
 
   if (dealType === "Novation") {
     contractPrice = formatMoney(payload.purchase_price_novation);
-    closingDate = payload.closing_date_novation || "";
-    underContractDate = payload.date_completed_by_novation || "";
-    earnestMoney = payload.emd_novation || "";
-    if (payload.additional_terms) notes.push("Terms: " + payload.additional_terms);
+    closingDate = formatDate(payload.closing_date_novation);
+    underContractDate = formatDate(payload.date_completed_by_novation);
+    earnestMoney = clean(payload.emd_novation);
+    if (clean(payload.additional_terms)) notes.push("Terms: " + clean(payload.additional_terms));
   } else if (dealType === "Cash") {
     contractPrice = formatMoney(payload.purchase_price_cash);
-    closingDate = payload.closing_date_cash || "";
-    underContractDate = payload.date_completed_by_cash || "";
-    balanceAtClosing = payload.amt_due_at_closing_cash || "";
-    if (payload.due_diligence_cash) notes.push("Due Diligence: " + payload.due_diligence_cash + " days");
-  } else if (dealType === "Sub-To") {
+    closingDate = formatDate(payload.closing_date_cash);
+    underContractDate = formatDate(payload.date_completed_by_cash);
+    balanceAtClosing = clean(payload.amt_due_at_closing_cash);
+    if (clean(payload.due_diligence_cash)) notes.push("Due Diligence: " + clean(payload.due_diligence_cash) + " days");
+  } else if (dealType === "Subject-to") {
     contractPrice = formatMoney(payload.total_purchase_price);
+    closingDate = formatDate(payload.closing_date);
+    underContractDate = formatDate(payload.date_and_time_completed_by);
     existingMortgage = formatMoney(payload.existing_mortgage_balance);
-    if (payload.monthly_mortgage_payment) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
-    if (payload.years_remaining_on_mortgage) notes.push("Years Remaining: " + payload.years_remaining_on_mortgage);
-    if (payload.months_remaining_on_mortgage) notes.push("Months Remaining: " + payload.months_remaining_on_mortgage);
-    if (payload.deposit) earnestMoney = formatMoney(payload.deposit);
+    if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
+    if (clean(payload.years_remaining_on_mortgage)) notes.push("Years Remaining: " + clean(payload.years_remaining_on_mortgage));
+    if (clean(payload.months_remaining_on_mortgage)) notes.push("Months Remaining: " + clean(payload.months_remaining_on_mortgage));
+    if (clean(payload.due_diligence_period__of_days)) notes.push("Due Diligence: " + clean(payload.due_diligence_period__of_days) + " days");
+    if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
   } else if (dealType === "Seller Finance") {
     contractPrice = formatMoney(payload.total_purchase_price);
+    closingDate = formatDate(payload.closing_date);
+    underContractDate = formatDate(payload.date_and_time_completed_by);
     existingMortgage = formatMoney(payload.existing_mortgage_balance);
-    if (payload.seller_finance_terms) notes.push("SF Terms: " + payload.seller_finance_terms);
-    if (payload.monthly_mortgage_payment) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
-    if (payload.down_payment) notes.push("Down Payment: " + formatMoney(payload.down_payment));
-    if (payload.deposit) earnestMoney = formatMoney(payload.deposit);
+    if (clean(payload.seller_finance_terms)) notes.push("SF Terms: " + clean(payload.seller_finance_terms));
+    if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
+    if (clean(payload.down_payment)) notes.push("Down Payment: " + formatMoney(payload.down_payment));
+    if (clean(payload.due_diligence_period__of_days)) notes.push("Due Diligence: " + clean(payload.due_diligence_period__of_days) + " days");
+    if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
   }
 
-  // Amendment overrides
-  if (payload.amendment_purchase_price) {
+  if (clean(payload.amendment_purchase_price)) {
     contractPrice = formatMoney(payload.amendment_purchase_price);
     notes.push("Amendment applied");
   }
-  if (payload.amendment_closing_date) {
-    closingDate = payload.amendment_closing_date;
+  if (clean(payload.amendment_closing_date)) {
+    closingDate = formatDate(payload.amendment_closing_date);
   }
-  if (payload.amendment__other_notes) {
-    notes.push("Amendment Notes: " + payload.amendment__other_notes);
+  if (clean(payload.amendment__other_notes)) {
+    notes.push("Amendment Notes: " + clean(payload.amendment__other_notes));
   }
 
-  // EMD formatting
   if (earnestMoney) notes.push("EMD: " + earnestMoney);
   if (existingMortgage) notes.push("Existing Mortgage: " + existingMortgage);
   if (balanceAtClosing) notes.push("Balance at Closing: " + balanceAtClosing);
 
-  // Derive month from under-contract date
   let month = "";
-  if (underContractDate) {
-    try {
-      const d = new Date(underContractDate);
-      if (!isNaN(d)) month = d.toLocaleString("en-US", { month: "long" });
-    } catch (_) {}
-  }
+  if (underContractDate) month = formatMonthYear(underContractDate);
 
   return {
     dealId: sellerName || "Unknown",
     propertyAddress,
-    market,
+    market: cleanMarket || state || "",
     acqOwner: "Brennen",
-    dispositionOwner: "",
+    dispositionOwner: "Aubrey",
     dealStatus: "Under Contract",
     strategy: dealType,
-    exitType: "",
+    exitType: "Assignment",
     underContractDate,
     closeDateActualEst: closingDate,
     month,
@@ -215,15 +251,6 @@ function extractDeal(payload) {
     finalProfit: "",
     notes: notes.join(" | "),
   };
-}
-
-function formatMoney(val) {
-  if (!val) return "";
-  const s = String(val).replace(/[^0-9.]/g, "");
-  if (!s) return "";
-  const num = parseFloat(s);
-  if (isNaN(num)) return "";
-  return "$" + num.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 // ─── Row Builder ─────────────────────────────────────────────────────────────
@@ -249,21 +276,39 @@ async function writeToLedger(env, deal) {
   const tableName = env.LEDGER_TABLE_NAME || "DealLedger";
   const insertUrl = worksheetUrl + "/tables('" + tableName + "')/rows";
 
-  // Create a workbook session to handle stale editing locks
   let sessionId = null;
   try {
     const session = await graphPost(token, workbookUrl + "/createSession", { persistChanges: true });
     sessionId = session.id;
-    console.log("Workbook session created: " + sessionId);
   } catch (err) {
-    console.error("Failed to create workbook session: " + err.message);
+    console.error("Session failed: " + err.message);
   }
   const sessionHeaders = sessionId ? { "workbook-session-id": sessionId } : {};
 
+  // Insert the row
   const rowValues = dealToRow(deal);
   await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
+  console.log("Row inserted: " + deal.dealId + " | " + deal.strategy);
 
-  // Close the workbook session
+  // Format the row — white fill, blue font, size 12
+  const patchHeaders = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    ...(sessionId ? { "workbook-session-id": sessionId } : {}),
+  };
+  try {
+    await fetch(worksheetUrl + "/range(address='A4:R4')/format/font", {
+      method: "PATCH", headers: patchHeaders,
+      body: JSON.stringify({ color: "0000FF", size: 12 }),
+    });
+    await fetch(worksheetUrl + "/range(address='A4:R4')/format/fill", {
+      method: "PATCH", headers: patchHeaders,
+      body: JSON.stringify({ color: "FFFFFF" }),
+    });
+    console.log("Format applied.");
+  } catch (_) {}
+
+  // Close session
   if (sessionId) {
     try {
       await fetch(workbookUrl + "/closeSession", {
@@ -275,7 +320,6 @@ async function writeToLedger(env, deal) {
         },
         body: "{}",
       });
-      console.log("Workbook session closed.");
     } catch (_) {}
   }
 
@@ -285,15 +329,12 @@ async function writeToLedger(env, deal) {
 // ─── Flatten nested GHL payload ─────────────────────────────────────────────
 
 function flattenPayload(raw) {
-  // GHL webhooks sometimes nest contact data under a "contact" or "customData" key.
-  // This flattener pulls everything to the top level so field access is simple.
   const flat = {};
 
   function merge(obj) {
     if (!obj || typeof obj !== "object") return;
     for (const [key, val] of Object.entries(obj)) {
       if (val && typeof val === "object" && !Array.isArray(val) && key !== "customData") {
-        // Don't overwrite top-level keys with nested objects — recurse into them
         merge(val);
       } else {
         flat[key] = val;
@@ -303,19 +344,14 @@ function flattenPayload(raw) {
 
   merge(raw);
 
-  // Also handle GHL's customData array format: [{ id, value, field_key }]
   if (Array.isArray(raw.customData)) {
     for (const item of raw.customData) {
-      if (item.field_key && item.value !== undefined) {
-        flat[item.field_key] = item.value;
-      }
+      if (item.field_key && item.value !== undefined) flat[item.field_key] = item.value;
     }
   }
   if (raw.contact && Array.isArray(raw.contact.customData)) {
     for (const item of raw.contact.customData) {
-      if (item.field_key && item.value !== undefined) {
-        flat[item.field_key] = item.value;
-      }
+      if (item.field_key && item.value !== undefined) flat[item.field_key] = item.value;
     }
   }
 
@@ -328,44 +364,22 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Health check
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({ status: "ok", time: new Date().toISOString() }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    // Webhook endpoint — receives POST from GHL
     if (url.pathname === "/webhook" && request.method === "POST") {
       try {
         const rawPayload = await request.json();
-        console.log("Webhook received. Keys: " + Object.keys(rawPayload).join(", "));
-
-        // Deduplicate — skip if we already processed this event
-        const eventId = rawPayload.id || rawPayload.event_id || rawPayload.contactId || rawPayload.contact_id || "";
-        if (eventId) {
-          const dedupeKey = "webhook_" + eventId;
-          const already = await env.GHL_KV.get(dedupeKey);
-          if (already) {
-            console.log("Duplicate webhook, skipping: " + eventId);
-            return new Response(JSON.stringify({ status: "duplicate", eventId }), {
-              headers: { "Content-Type": "application/json" },
-            });
-          }
-        }
+        console.log("Webhook received: " + Object.keys(rawPayload).join(", "));
 
         const payload = flattenPayload(rawPayload);
-        console.log("Flattened keys: " + Object.keys(payload).join(", "));
-
         const deal = extractDeal(payload);
-        console.log("Deal: " + deal.dealId + " | " + deal.propertyAddress + " | " + deal.strategy + " | " + deal.contractPrice);
+        console.log("Deal: " + deal.dealId + " | " + deal.strategy + " | " + deal.contractPrice);
 
         const result = await writeToLedger(env, deal);
-
-        // Mark as processed
-        if (eventId) {
-          await env.GHL_KV.put("webhook_" + eventId, "done", { expirationTtl: 90 * 24 * 60 * 60 });
-        }
 
         return new Response(JSON.stringify(result), {
           headers: { "Content-Type": "application/json" },
@@ -379,19 +393,12 @@ export default {
       }
     }
 
-    // Debug/test endpoint — send a test payload via POST to /test
     if (url.pathname === "/test" && request.method === "POST") {
       try {
         const rawPayload = await request.json();
         const payload = flattenPayload(rawPayload);
         const deal = extractDeal(payload);
-        // Don't write to SharePoint — just return what would be inserted
-        return new Response(JSON.stringify({
-          detectedType: deal.strategy,
-          deal,
-          row: dealToRow(deal),
-          flattenedKeys: Object.keys(payload),
-        }, null, 2), {
+        return new Response(JSON.stringify({ deal, row: dealToRow(deal) }, null, 2), {
           headers: { "Content-Type": "application/json" },
         });
       } catch (err) {
