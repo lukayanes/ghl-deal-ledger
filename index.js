@@ -1,14 +1,15 @@
 /**
- * GHL Deal Ledger Worker
+ * GHL Deal Ledger Worker — Webhook Edition
  *
- * Polls Outlook inbox for GoHighLevel "Document signed successfully" emails,
- * downloads the attached signed PDF contract, parses deal data from it,
- * and inserts a new row at row 4 of the Summit Group Deal Ledger on SharePoint.
+ * Receives a webhook POST from GoHighLevel when a contract is signed,
+ * extracts deal data from the contact's custom fields, and inserts a
+ * new row at row 4 (top of data) of the Summit Group Deal Ledger on SharePoint.
  *
- * Supports three contract types:
- *   - Novation  ("CONTRACT FOR THE SALE & PURCHASE OF REAL ESTATE")
- *   - Cash      ("Standard Purchase and Sales Agreement" — no existing mortgage)
- *   - Sub-To    ("Standard Purchase and Sales Agreement" — has existing mortgage)
+ * Supports four deal types:
+ *   - Novation
+ *   - Cash
+ *   - Sub-To
+ *   - Seller Finance
  *
  * ZERO external dependencies — deploys as a single file.
  */
@@ -76,290 +77,158 @@ async function graphPost(token, url, body, extraHeaders) {
   return res.json();
 }
 
-// ─── PDF Text Extraction (no dependencies) ───────────────────────────────────
+// ─── Deal Type Detection ────────────────────────────────────────────────────
 
-async function decompress(data) {
-  // Try zlib (standard PDF FlateDecode), then raw deflate as fallback
-  for (const fmt of ["deflate", "deflate-raw"]) {
-    try {
-      const ds = new DecompressionStream(fmt);
-      const writer = ds.writable.getWriter();
-      const reader = ds.readable.getReader();
-      writer.write(data);
-      writer.close();
-      const chunks = [];
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-      let totalLen = 0;
-      for (const c of chunks) totalLen += c.length;
-      const result = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const c of chunks) { result.set(c, offset); offset += c.length; }
-      return result;
-    } catch (_) { continue; }
+function detectDealType(payload) {
+  // 1. Check explicit field if provided
+  const explicit = (payload.deal_type || payload.dealType || "").toLowerCase();
+  if (explicit.includes("novation")) return "Novation";
+  if (explicit.includes("cash")) return "Cash";
+  if (explicit.includes("sub to") || explicit.includes("sub_to") || explicit.includes("subject to")) return "Sub-To";
+  if (explicit.includes("seller finance") || explicit.includes("seller_finance")) return "Seller Finance";
+
+  // 2. Check document/workflow name if provided
+  const docName = (payload.document_name || payload.workflow_name || payload.name || "").toLowerCase();
+  if (docName.includes("novation")) return "Novation";
+  if (docName.includes("cash")) return "Cash";
+  if (docName.includes("sub to") || docName.includes("sub_to") || docName.includes("subject to")) return "Sub-To";
+  if (docName.includes("seller finance") || docName.includes("seller_finance")) return "Seller Finance";
+
+  // 3. Detect from which custom fields are filled
+  if (payload.purchase_price_novation || payload.closing_date_novation || payload.emd_novation) {
+    return "Novation";
   }
-  return null;
-}
-
-function decodePdfString(s) {
-  let result = "";
-  let i = 0;
-  while (i < s.length) {
-    if (s[i] === "\\" && i + 1 < s.length) {
-      i++;
-      switch (s[i]) {
-        case "n": result += "\n"; break;
-        case "r": result += "\r"; break;
-        case "t": result += "\t"; break;
-        case "(": result += "("; break;
-        case ")": result += ")"; break;
-        case "\\": result += "\\"; break;
-        default:
-          if (s[i] >= "0" && s[i] <= "7") {
-            let octal = s[i];
-            if (i + 1 < s.length && s[i + 1] >= "0" && s[i + 1] <= "7") { octal += s[++i]; }
-            if (i + 1 < s.length && s[i + 1] >= "0" && s[i + 1] <= "7") { octal += s[++i]; }
-            result += String.fromCharCode(parseInt(octal, 8));
-          } else {
-            result += s[i];
-          }
-      }
-    } else {
-      result += s[i];
-    }
-    i++;
+  if (payload.purchase_price_cash || payload.closing_date_cash || payload.county_cash) {
+    return "Cash";
   }
-  return result;
-}
-
-function extractTextFromStream(streamText) {
-  const parts = [];
-  let m;
-
-  const tjRegex = /\(([^)]*(?:\\.[^)]*)*)\)\s*Tj/g;
-  while ((m = tjRegex.exec(streamText)) !== null) {
-    parts.push(decodePdfString(m[1]));
+  if (payload.seller_finance_terms) {
+    return "Seller Finance";
+  }
+  if (payload.existing_mortgage_balance || payload.monthly_mortgage_payment) {
+    return "Sub-To";
   }
 
-  const tjArrayRegex = /\[([^\]]*)\]\s*TJ/gi;
-  while ((m = tjArrayRegex.exec(streamText)) !== null) {
-    const inner = m[1];
-    const strRegex = /\(([^)]*(?:\\.[^)]*)*)\)/g;
-    let s;
-    while ((s = strRegex.exec(inner)) !== null) {
-      parts.push(decodePdfString(s[1]));
-    }
-  }
-
-  const quoteRegex = /\(([^)]*(?:\\.[^)]*)*)\)\s*'/g;
-  while ((m = quoteRegex.exec(streamText)) !== null) {
-    parts.push("\n" + decodePdfString(m[1]));
-  }
-
-  return parts.join("");
-}
-
-async function extractPdfText(base64Content) {
-  // atob produces a binary string — scanning it with indexOf is native and fast.
-  // We avoid building a Uint8Array of the full PDF (which requires a slow
-  // per-byte JS loop). Instead we only convert individual stream slices,
-  // which are small (< 100 KB each).
-  const raw = atob(base64Content);
-  const allText = [];
-
-  let pos = 0;
-  let streamCount = 0;
-  const MAX_STREAMS = 20; // hard cap on decompression attempts
-
-  while (pos < raw.length && streamCount < MAX_STREAMS) {
-    let streamMarker = raw.indexOf("stream\r\n", pos);
-    let markerLen = 8;
-    if (streamMarker === -1) {
-      streamMarker = raw.indexOf("stream\n", pos);
-      markerLen = 7;
-    }
-    if (streamMarker === -1) break;
-
-    const dataStart = streamMarker + markerLen;
-
-    let streamEnd = raw.indexOf("\r\nendstream", dataStart);
-    let endLen = 12;
-    if (streamEnd === -1) {
-      streamEnd = raw.indexOf("\nendstream", dataStart);
-      endLen = 10;
-    }
-    if (streamEnd === -1) break;
-
-    pos = streamEnd + endLen;
-    streamCount++;
-
-    // Skip tiny streams (font/metadata tokens) and enormous ones (JPEG images).
-    // Contract text streams in GHL PDFs are typically 10 KB – 150 KB compressed.
-    const streamLen = streamEnd - dataStart;
-    if (streamLen < 100 || streamLen > 150000) continue;
-
-    try {
-      const streamData = raw.slice(dataStart, streamEnd);
-      // Convert only this slice to bytes — much cheaper than doing the full PDF
-      const streamBytes = Uint8Array.from(streamData, (c) => c.charCodeAt(0));
-      const decompressed = await decompress(streamBytes);
-      const streamText = decompressed
-        ? new TextDecoder("latin1").decode(decompressed)
-        : streamData;
-
-      const text = extractTextFromStream(streamText);
-      if (text.trim()) allText.push(text);
-    } catch (_) {}
-
-    // Early exit once we have enough text to parse all contract fields
-    if (allText.join("").length > 2000) break;
-  }
-
-  return allText.join(" ").replace(/\s+/g, " ").trim();
-}
-
-// ─── Contract Type Detection ─────────────────────────────────────────────────
-
-function detectContractType(subject) {
-  const s = subject.toLowerCase();
-  if (s.includes("novation")) return "Novation";
-  if (s.includes("sub to") || s.includes("sub_to") || s.includes("subject to")) return "Sub-To";
-  if (s.includes("cash")) return "Cash";
   return "Unknown";
 }
 
-// ─── Contract Parsers ────────────────────────────────────────────────────────
+// ─── Extract Deal from Webhook Payload ──────────────────────────────────────
 
-function createEmptyDeal() {
+function extractDeal(payload) {
+  const dealType = detectDealType(payload);
+
+  // Seller name from standard contact fields
+  const firstName = payload.first_name || payload.firstName || payload.contact_first_name || "";
+  const lastName = payload.last_name || payload.lastName || payload.contact_last_name || "";
+  const sellerName = (firstName + " " + lastName).trim();
+
+  // Property address
+  const fullAddress = payload.full_address_1 || "";
+  const street = payload.address1 || payload.street_address || "";
+  const city = payload.city || "";
+  const state = payload.state || "";
+  const zip = payload.postal_code || payload.zip || "";
+  const propertyAddress = fullAddress || [street, city, state, zip].filter(Boolean).join(", ");
+
+  // Market (county or state)
+  const market = payload.county_cash || payload.county || state || "";
+
+  // Deal-type-specific fields
+  let contractPrice = "";
+  let closingDate = "";
+  let underContractDate = "";
+  let earnestMoney = "";
+  let existingMortgage = "";
+  let balanceAtClosing = "";
+  let notes = ["Auto-added from GHL webhook."];
+
+  if (dealType === "Novation") {
+    contractPrice = formatMoney(payload.purchase_price_novation);
+    closingDate = payload.closing_date_novation || "";
+    underContractDate = payload.date_completed_by_novation || "";
+    earnestMoney = payload.emd_novation || "";
+    if (payload.additional_terms) notes.push("Terms: " + payload.additional_terms);
+  } else if (dealType === "Cash") {
+    contractPrice = formatMoney(payload.purchase_price_cash);
+    closingDate = payload.closing_date_cash || "";
+    underContractDate = payload.date_completed_by_cash || "";
+    balanceAtClosing = payload.amt_due_at_closing_cash || "";
+    if (payload.due_diligence_cash) notes.push("Due Diligence: " + payload.due_diligence_cash + " days");
+  } else if (dealType === "Sub-To") {
+    contractPrice = formatMoney(payload.total_purchase_price);
+    existingMortgage = formatMoney(payload.existing_mortgage_balance);
+    if (payload.monthly_mortgage_payment) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
+    if (payload.years_remaining_on_mortgage) notes.push("Years Remaining: " + payload.years_remaining_on_mortgage);
+    if (payload.months_remaining_on_mortgage) notes.push("Months Remaining: " + payload.months_remaining_on_mortgage);
+    if (payload.deposit) earnestMoney = formatMoney(payload.deposit);
+  } else if (dealType === "Seller Finance") {
+    contractPrice = formatMoney(payload.total_purchase_price);
+    existingMortgage = formatMoney(payload.existing_mortgage_balance);
+    if (payload.seller_finance_terms) notes.push("SF Terms: " + payload.seller_finance_terms);
+    if (payload.monthly_mortgage_payment) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
+    if (payload.down_payment) notes.push("Down Payment: " + formatMoney(payload.down_payment));
+    if (payload.deposit) earnestMoney = formatMoney(payload.deposit);
+  }
+
+  // Amendment overrides
+  if (payload.amendment_purchase_price) {
+    contractPrice = formatMoney(payload.amendment_purchase_price);
+    notes.push("Amendment applied");
+  }
+  if (payload.amendment_closing_date) {
+    closingDate = payload.amendment_closing_date;
+  }
+  if (payload.amendment__other_notes) {
+    notes.push("Amendment Notes: " + payload.amendment__other_notes);
+  }
+
+  // EMD formatting
+  if (earnestMoney) notes.push("EMD: " + earnestMoney);
+  if (existingMortgage) notes.push("Existing Mortgage: " + existingMortgage);
+  if (balanceAtClosing) notes.push("Balance at Closing: " + balanceAtClosing);
+
+  // Derive month from under-contract date
+  let month = "";
+  if (underContractDate) {
+    try {
+      const d = new Date(underContractDate);
+      if (!isNaN(d)) month = d.toLocaleString("en-US", { month: "long" });
+    } catch (_) {}
+  }
+
   return {
-    dealId: "", propertyAddress: "", market: "", acqOwner: "Brennen",
-    dispositionOwner: "", dealStatus: "Under Contract", strategy: "", exitType: "",
-    underContractDate: "", closeDateActualEst: "", month: "", contractPrice: "",
-    listedPostedPrice: "", buyerPriceSalePrice: "", repairs: "", potentialProfit: "",
-    finalProfit: "", notes: "", sellerName: "", earnestMoney: "",
-    existingMortgage: "", balanceAtClosing: "",
+    dealId: sellerName || "Unknown",
+    propertyAddress,
+    market,
+    acqOwner: "Brennen",
+    dispositionOwner: "",
+    dealStatus: "Under Contract",
+    strategy: dealType,
+    exitType: "",
+    underContractDate,
+    closeDateActualEst: closingDate,
+    month,
+    contractPrice,
+    listedPostedPrice: "",
+    buyerPriceSalePrice: "",
+    repairs: "",
+    potentialProfit: "",
+    finalProfit: "",
+    notes: notes.join(" | "),
   };
 }
 
-function extractMarketFromAddress(address) {
-  if (!address) return "";
-  const m = address.match(/,\s*([A-Z]{2})\s*\d{0,5}\s*$/);
-  if (m) return m[1];
-  const parts = address.split(",").map((s) => s.trim());
-  if (parts.length >= 2) return parts[parts.length - 1].replace(/\d{5}/, "").trim();
-  return "";
-}
-
-function parseNovationContract(text) {
-  const deal = createEmptyDeal();
-  deal.strategy = "Novation";
-
-  const sellerMatch = text.match(/PARTIES:\s*(.+?)\s*\(Seller\)/i);
-  if (sellerMatch) deal.sellerName = sellerMatch[1].trim();
-
-  const propertyMatch = text.match(/SUBJECT PROPERTY:\s*(.+?)(?:\s*hereinafter|\s*$)/im);
-  if (propertyMatch) deal.propertyAddress = propertyMatch[1].trim().replace(/\s+/g, " ");
-
-  const priceMatch = text.match(/PURCHASE PRICE:\s*\$?([\d,]+(?:\.\d{2})?)/i);
-  if (priceMatch) deal.contractPrice = "$" + priceMatch[1];
-
-  const closingMatch =
-    text.match(/closing will take place on or before:\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s*\d{4})/i) ||
-    text.match(/on or before:\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s*\d{4})/i);
-  if (closingMatch) deal.closeDateActualEst = closingMatch[1].trim();
-
-  const sigDateMatch = text.match(/(\d{2})\s*\/\s*(\d{2})\s*\/\s*(\d{2,4})/);
-  if (sigDateMatch) {
-    const year = sigDateMatch[3].length === 2 ? "20" + sigDateMatch[3] : sigDateMatch[3];
-    deal.underContractDate = sigDateMatch[1] + "/" + sigDateMatch[2] + "/" + year;
-  }
-
-  const earnestMatch = text.match(/earnest money deposit of \$\s*([\d,]+)/i);
-  if (earnestMatch) deal.earnestMoney = "$" + earnestMatch[1];
-
-  deal.market = extractMarketFromAddress(deal.propertyAddress);
-
-  const refMatch = text.match(/Document Ref:\s*([\w-]+)/i);
-  if (refMatch) deal.dealId = refMatch[1];
-
-  return deal;
-}
-
-function parseStandardContract(text, fallbackType) {
-  const deal = createEmptyDeal();
-
-  const sellerMatch = text.match(/\(BUYER\)\s*and\s+(.+?)\s*\(SELLER\)/i);
-  if (sellerMatch) deal.sellerName = sellerMatch[1].trim();
-
-  const addressMatch =
-    text.match(/Address\s+(.+?)(?:\s*Legal Description)/i) ||
-    text.match(/described as follows:\s*Address\s+(.+?)(?:\s*Legal)/i);
-  if (addressMatch) deal.propertyAddress = addressMatch[1].trim().replace(/\s+/g, " ");
-
-  const countyMatch = text.match(/Property is in\s+(.+?)\s+County/i);
-  if (countyMatch) deal.market = countyMatch[1].trim();
-
-  const totalPriceMatch =
-    text.match(/H\.\s*\$?([\d,]+(?:\.\d{2})?)/i) ||
-    text.match(/Total Purchase Price.+?\$\s*([\d,]+(?:\.\d{2})?)/i);
-  if (totalPriceMatch) deal.contractPrice = "$" + totalPriceMatch[1];
-
-  const mortgageMatch = text.match(/G\.\s*\$?([\d,]+(?:\.\d{2})?)/i);
-  const existingMortgage = mortgageMatch ? parseFloat(mortgageMatch[1].replace(/,/g, "")) : 0;
-  if (existingMortgage > 0) {
-    deal.strategy = "Sub-To";
-    deal.existingMortgage = "$" + mortgageMatch[1];
-  } else {
-    deal.strategy = fallbackType === "Sub-To" ? "Sub-To" : "Cash";
-  }
-
-  const balanceMatch = text.match(/C\.\s*\$?([\d,]+(?:\.\d{2})?)/i);
-  if (balanceMatch) deal.balanceAtClosing = "$" + balanceMatch[1];
-
-  const binderMatch = text.match(/A\.\s*\$?([\d,]+(?:\.\d{2})?)/i);
-  if (binderMatch) deal.earnestMoney = "$" + binderMatch[1];
-
-  const closingMatch = text.match(/on or before\s+([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s*\d{4})/i);
-  if (closingMatch) deal.closeDateActualEst = closingMatch[1].trim();
-
-  const offerDateMatch = text.match(/Date of Offer\s+(\d{2})\s*\/\s*(\d{2})\s*\/\s*(\d{4})/i);
-  if (offerDateMatch) {
-    deal.underContractDate = offerDateMatch[1] + "/" + offerDateMatch[2] + "/" + offerDateMatch[3];
-  } else {
-    const sigDateMatch = text.match(/(\d{2})\s*\/\s*(\d{2})\s*\/\s*(\d{4})/);
-    if (sigDateMatch) deal.underContractDate = sigDateMatch[1] + "/" + sigDateMatch[2] + "/" + sigDateMatch[3];
-  }
-
-  const stateMatch = text.match(/construed under\s+([A-Z]{2})\s+Law/i);
-  if (stateMatch && !deal.market) deal.market = stateMatch[1];
-
-  const refMatch = text.match(/Document Ref:\s*([\w-]+)/i);
-  if (refMatch) deal.dealId = refMatch[1];
-
-  return deal;
+function formatMoney(val) {
+  if (!val) return "";
+  const s = String(val).replace(/[^0-9.]/g, "");
+  if (!s) return "";
+  const num = parseFloat(s);
+  if (isNaN(num)) return "";
+  return "$" + num.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 // ─── Row Builder ─────────────────────────────────────────────────────────────
 
 function dealToRow(deal) {
-  if (deal.underContractDate && !deal.month) {
-    try {
-      const d = new Date(deal.underContractDate);
-      if (!isNaN(d)) deal.month = d.toLocaleString("en-US", { month: "long" });
-    } catch (_) {}
-  }
-
-  deal.dealId = deal.sellerName || deal.dealId;
-
-  const noteParts = ["Auto-added from GHL contract PDF."];
-  if (deal.earnestMoney) noteParts.push("EMD: " + deal.earnestMoney);
-  if (deal.existingMortgage) noteParts.push("Existing Mortgage: " + deal.existingMortgage);
-  if (deal.balanceAtClosing) noteParts.push("Balance at Closing: " + deal.balanceAtClosing);
-  deal.notes = noteParts.join(" | ");
-
   return [[
     deal.dealId, deal.propertyAddress, deal.market, deal.acqOwner,
     deal.dispositionOwner, deal.dealStatus, deal.strategy, deal.exitType,
@@ -369,42 +238,18 @@ function dealToRow(deal) {
   ]];
 }
 
-// ─── Main Logic ──────────────────────────────────────────────────────────────
+// ─── Write to SharePoint ────────────────────────────────────────────────────
 
-async function processSigningEmails(env) {
+async function writeToLedger(env, deal) {
   const token = await getAccessToken(env);
-  const userEmail = env.TARGET_MAILBOX;
-
-  let lastProcessed = await env.GHL_KV.get("last_processed_timestamp");
-  if (!lastProcessed) {
-    lastProcessed = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  }
-
-  const filter = encodeURIComponent(
-    "receivedDateTime ge " + lastProcessed + " and contains(subject, 'signed') and hasAttachments eq true"
-  );
-  const messagesUrl =
-    "https://graph.microsoft.com/v1.0/users/" + userEmail + "/messages?$filter=" + filter + "&$orderby=receivedDateTime asc&$top=50&$select=id,subject,body,receivedDateTime,from,hasAttachments";
-
-  const messages = await graphGet(token, messagesUrl);
-  const emails = (messages.value || []).filter(function(e) {
-    const sender = e.from?.emailAddress?.address || "";
-    const body = e.body?.content || "";
-    return sender.includes("msgsndr.net") && body.toLowerCase().includes("document signed successfully");
-  });
-
-  if (emails.length === 0) {
-    console.log("No new GHL signing emails with attachments found.");
-    return { processed: 0 };
-  }
-
-  console.log("Found " + emails.length + " signing email(s) with attachments.");
 
   const siteUrl = "https://graph.microsoft.com/v1.0/sites/" + env.SHAREPOINT_SITE_ID;
   const workbookUrl = siteUrl + "/drive/root:/" + env.LEDGER_FILE_PATH + ":/workbook";
   const worksheetUrl = workbookUrl + "/worksheets('" + (env.LEDGER_SHEET_NAME || "Sheet1") + "')";
+  const tableName = env.LEDGER_TABLE_NAME || "DealLedger";
+  const insertUrl = worksheetUrl + "/tables('" + tableName + "')/rows";
 
-  // Create a workbook session — this forces through stale editing locks
+  // Create a workbook session to handle stale editing locks
   let sessionId = null;
   try {
     const session = await graphPost(token, workbookUrl + "/createSession", { persistChanges: true });
@@ -412,102 +257,13 @@ async function processSigningEmails(env) {
     console.log("Workbook session created: " + sessionId);
   } catch (err) {
     console.error("Failed to create workbook session: " + err.message);
-    // Continue without session — might work if the file is unlocked
   }
   const sessionHeaders = sessionId ? { "workbook-session-id": sessionId } : {};
 
-  let processedCount = 0;
-  let latestTimestamp = lastProcessed;
-  const debugLog = [];
+  const rowValues = dealToRow(deal);
+  await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
 
-  for (const email of emails) {
-    const emailKey = "processed_email_" + email.id;
-    const alreadyDone = await env.GHL_KV.get(emailKey);
-    if (alreadyDone) {
-      debugLog.push({ emailId: email.id, subject: email.subject, status: "skipped_already_done" });
-      continue;
-    }
-
-    const emailDebug = { emailId: email.id, subject: email.subject, status: "unknown" };
-    try {
-      const contractType = detectContractType(email.subject);
-      emailDebug.contractType = contractType;
-      console.log("Processing: " + email.subject + " -> type: " + contractType);
-
-      // Fetch attachment list first to get IDs
-      const attUrl = "https://graph.microsoft.com/v1.0/users/" + userEmail + "/messages/" + email.id + "/attachments?$select=id,name,size,contentType";
-      const attachments = await graphGet(token, attUrl);
-      const attList = (attachments.value || []);
-      emailDebug.attachments = attList.map(function(a) { return { name: a.name, size: a.size, type: a.contentType }; });
-
-      // Find the PDF in the list
-      const pdfAttMeta = attList.find(function(a) {
-        return (a.name || "").toLowerCase().endsWith(".pdf") || (a.contentType || "").includes("pdf");
-      });
-
-      if (!pdfAttMeta) {
-        emailDebug.status = "no_pdf_attachment";
-        debugLog.push(emailDebug);
-        console.log("No PDF attachment for email " + email.id);
-        continue;
-      }
-
-      emailDebug.pdfName = pdfAttMeta.name;
-      emailDebug.pdfSize = pdfAttMeta.size;
-
-      // Fetch the full attachment content by ID (handles large files that omit contentBytes in list)
-      const fullAttUrl = "https://graph.microsoft.com/v1.0/users/" + userEmail + "/messages/" + email.id + "/attachments/" + pdfAttMeta.id;
-      const fullAtt = await graphGet(token, fullAttUrl);
-
-      if (!fullAtt.contentBytes) {
-        emailDebug.status = "no_content_bytes";
-        debugLog.push(emailDebug);
-        console.log("No contentBytes for attachment " + pdfAttMeta.id);
-        continue;
-      }
-
-      emailDebug.contentBytesLen = fullAtt.contentBytes.length;
-      const pdfText = await extractPdfText(fullAtt.contentBytes);
-      emailDebug.extractedChars = pdfText.length;
-      emailDebug.pdfSnippet = pdfText.slice(0, 200);
-      console.log("Extracted " + pdfText.length + " chars from PDF.");
-
-      let deal;
-      if (contractType === "Novation" || pdfText.includes("CONTRACT FOR THE SALE & PURCHASE")) {
-        deal = parseNovationContract(pdfText);
-        emailDebug.parsedType = "Novation";
-      } else {
-        deal = parseStandardContract(pdfText, contractType);
-        emailDebug.parsedType = deal.strategy;
-      }
-
-      emailDebug.deal = { sellerName: deal.sellerName, address: deal.propertyAddress, price: deal.contractPrice, strategy: deal.strategy };
-
-      const rowValues = dealToRow(deal);
-      const tableName = env.LEDGER_TABLE_NAME || "DealLedger";
-      const insertUrl = worksheetUrl + "/tables('" + tableName + "')/rows";
-      emailDebug.insertUrl = insertUrl;
-
-      await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
-
-      emailDebug.status = "success";
-      console.log("Inserted: " + deal.propertyAddress + " (" + deal.strategy + ") - " + deal.contractPrice);
-
-      await env.GHL_KV.put(emailKey, "done", { expirationTtl: 90 * 24 * 60 * 60 });
-      processedCount++;
-
-      if (email.receivedDateTime > latestTimestamp) {
-        latestTimestamp = email.receivedDateTime;
-      }
-    } catch (err) {
-      emailDebug.status = "error";
-      emailDebug.error = err.message;
-      console.error("Error processing email " + email.id + ": " + err.message);
-    }
-    debugLog.push(emailDebug);
-  }
-
-  // Close the workbook session to release the lock
+  // Close the workbook session
   if (sessionId) {
     try {
       await fetch(workbookUrl + "/closeSession", {
@@ -523,39 +279,119 @@ async function processSigningEmails(env) {
     } catch (_) {}
   }
 
-  if (latestTimestamp !== lastProcessed) {
-    await env.GHL_KV.put("last_processed_timestamp", latestTimestamp);
+  return { success: true, deal: deal.dealId, address: deal.propertyAddress, strategy: deal.strategy };
+}
+
+// ─── Flatten nested GHL payload ─────────────────────────────────────────────
+
+function flattenPayload(raw) {
+  // GHL webhooks sometimes nest contact data under a "contact" or "customData" key.
+  // This flattener pulls everything to the top level so field access is simple.
+  const flat = {};
+
+  function merge(obj) {
+    if (!obj || typeof obj !== "object") return;
+    for (const [key, val] of Object.entries(obj)) {
+      if (val && typeof val === "object" && !Array.isArray(val) && key !== "customData") {
+        // Don't overwrite top-level keys with nested objects — recurse into them
+        merge(val);
+      } else {
+        flat[key] = val;
+      }
+    }
   }
 
-  return { processed: processedCount, total: emails.length, debug: debugLog };
+  merge(raw);
+
+  // Also handle GHL's customData array format: [{ id, value, field_key }]
+  if (Array.isArray(raw.customData)) {
+    for (const item of raw.customData) {
+      if (item.field_key && item.value !== undefined) {
+        flat[item.field_key] = item.value;
+      }
+    }
+  }
+  if (raw.contact && Array.isArray(raw.contact.customData)) {
+    for (const item of raw.contact.customData) {
+      if (item.field_key && item.value !== undefined) {
+        flat[item.field_key] = item.value;
+      }
+    }
+  }
+
+  return flat;
 }
 
 // ─── Worker Entry Points ─────────────────────────────────────────────────────
 
 export default {
-  async scheduled(event, env, ctx) {
-    console.log("Cron triggered at " + new Date().toISOString());
-    const result = await processSigningEmails(env);
-    console.log("Done. Processed " + result.processed + " of " + (result.total || 0) + " emails.");
-  },
-
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Health check
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({ status: "ok", time: new Date().toISOString() }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    if (url.pathname === "/run") {
-      const authHeader = request.headers.get("Authorization");
-      if (env.WORKER_SECRET && authHeader !== ("Bearer " + env.WORKER_SECRET)) {
-        return new Response("Unauthorized", { status: 401 });
-      }
+    // Webhook endpoint — receives POST from GHL
+    if (url.pathname === "/webhook" && request.method === "POST") {
       try {
-        const result = await processSigningEmails(env);
+        const rawPayload = await request.json();
+        console.log("Webhook received. Keys: " + Object.keys(rawPayload).join(", "));
+
+        // Deduplicate — skip if we already processed this event
+        const eventId = rawPayload.id || rawPayload.event_id || rawPayload.contactId || rawPayload.contact_id || "";
+        if (eventId) {
+          const dedupeKey = "webhook_" + eventId;
+          const already = await env.GHL_KV.get(dedupeKey);
+          if (already) {
+            console.log("Duplicate webhook, skipping: " + eventId);
+            return new Response(JSON.stringify({ status: "duplicate", eventId }), {
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+        }
+
+        const payload = flattenPayload(rawPayload);
+        console.log("Flattened keys: " + Object.keys(payload).join(", "));
+
+        const deal = extractDeal(payload);
+        console.log("Deal: " + deal.dealId + " | " + deal.propertyAddress + " | " + deal.strategy + " | " + deal.contractPrice);
+
+        const result = await writeToLedger(env, deal);
+
+        // Mark as processed
+        if (eventId) {
+          await env.GHL_KV.put("webhook_" + eventId, "done", { expirationTtl: 90 * 24 * 60 * 60 });
+        }
+
         return new Response(JSON.stringify(result), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        console.error("Webhook error: " + err.message);
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // Debug/test endpoint — send a test payload via POST to /test
+    if (url.pathname === "/test" && request.method === "POST") {
+      try {
+        const rawPayload = await request.json();
+        const payload = flattenPayload(rawPayload);
+        const deal = extractDeal(payload);
+        // Don't write to SharePoint — just return what would be inserted
+        return new Response(JSON.stringify({
+          detectedType: deal.strategy,
+          deal,
+          row: dealToRow(deal),
+          flattenedKeys: Object.keys(payload),
+        }, null, 2), {
           headers: { "Content-Type": "application/json" },
         });
       } catch (err) {
@@ -566,6 +402,6 @@ export default {
       }
     }
 
-    return new Response("GHL Deal Ledger Worker. Use /health or /run.", { status: 200 });
+    return new Response("GHL Deal Ledger Worker. POST to /webhook to add a deal.", { status: 200 });
   },
 };
