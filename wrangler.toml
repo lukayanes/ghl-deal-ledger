@@ -2,15 +2,14 @@ name = "ghl-deal-ledger"
 main = "index.js"
 compatibility_date = "2024-09-01"
 
-# Runs every 5 minutes
-[triggers]
-crons = ["*/5 * * * *"]
+# No cron needed — triggered by GHL webhook POST to /webhook
 
-# KV namespace binding — replace <YOUR_KV_NAMESPACE_ID> after creating it
+# KV namespace binding
 [[kv_namespaces]]
 binding = "GHL_KV"
-id = "20940742c3494b98a8475665e12f63b1"
+id = "<YOUR_KV_NAMESPACE_ID>"
 
+# Observability — Worker logs & traces
 [observability]
 [observability.logs]
 enabled = true
