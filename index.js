@@ -199,7 +199,6 @@ function extractDeal(payload) {
     if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
     if (clean(payload.years_remaining_on_mortgage)) notes.push("Years Remaining: " + clean(payload.years_remaining_on_mortgage));
     if (clean(payload.months_remaining_on_mortgage)) notes.push("Months Remaining: " + clean(payload.months_remaining_on_mortgage));
-    if (clean(payload.due_diligence_period__of_days)) notes.push("Due Diligence: " + clean(payload.due_diligence_period__of_days) + " days");
     if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
   } else if (dealType === "Seller Finance") {
     contractPrice = formatMoney(payload.total_purchase_price);
@@ -209,7 +208,6 @@ function extractDeal(payload) {
     if (clean(payload.seller_finance_terms)) notes.push("SF Terms: " + clean(payload.seller_finance_terms));
     if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
     if (clean(payload.down_payment)) notes.push("Down Payment: " + formatMoney(payload.down_payment));
-    if (clean(payload.due_diligence_period__of_days)) notes.push("Due Diligence: " + clean(payload.due_diligence_period__of_days) + " days");
     if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
   }
 
@@ -289,24 +287,6 @@ async function writeToLedger(env, deal) {
   const rowValues = dealToRow(deal);
   await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
   console.log("Row inserted: " + deal.dealId + " | " + deal.strategy);
-
-  // Format the row — white fill, blue font, size 12
-  const patchHeaders = {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-    ...(sessionId ? { "workbook-session-id": sessionId } : {}),
-  };
-  try {
-    await fetch(worksheetUrl + "/range(address='A4:R4')/format/font", {
-      method: "PATCH", headers: patchHeaders,
-      body: JSON.stringify({ color: "0000FF", size: 12 }),
-    });
-    await fetch(worksheetUrl + "/range(address='A4:R4')/format/fill", {
-      method: "PATCH", headers: patchHeaders,
-      body: JSON.stringify({ color: "FFFFFF" }),
-    });
-    console.log("Format applied.");
-  } catch (_) {}
 
   // Close session
   if (sessionId) {
