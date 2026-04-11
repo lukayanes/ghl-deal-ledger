@@ -156,12 +156,7 @@ function extractDeal(payload) {
   const zip = clean(payload.postal_code) || clean(payload.zip);
   const propertyAddress = fullAddress || [street, city, state, zip].filter(Boolean).join(", ");
 
-  let cleanMarket = "";
-  if (dealType === "Cash") {
-    cleanMarket = state || clean(payload.county_cash) || "";
-  } else {
-    cleanMarket = clean(payload.county_cash) || clean(payload.county) || state || "";
-  }
+  let cleanMarket = state || "";
   if (!cleanMarket && fullAddress) {
     const parts = fullAddress.split(",").map(function(s) { return s.trim(); });
     if (parts.length >= 3) {
@@ -288,13 +283,30 @@ async function writeToLedger(env, deal) {
   await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
   console.log("Row inserted: " + deal.dealId + " | " + deal.strategy);
 
+  // Format the row — white fill, blue font size 12
+  try {
+    const fmtHeaders = {
+      Authorization: "Bearer " + token,
+      "Content-Type": "application/json",
+    };
+    if (sessionId) fmtHeaders["workbook-session-id"] = sessionId;
+    await fetch(worksheetUrl + "/range(address='A4:R4')/format/fill", {
+      method: "PATCH", headers: fmtHeaders,
+      body: JSON.stringify({ color: "FFFFFF" }),
+    });
+    await fetch(worksheetUrl + "/range(address='A4:R4')/format/font", {
+      method: "PATCH", headers: fmtHeaders,
+      body: JSON.stringify({ color: "0000FF", size: 12 }),
+    });
+  } catch (_) {}
+
   // Close session
   if (sessionId) {
     try {
       await fetch(workbookUrl + "/closeSession", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: "Bearer " + token,
           "Content-Type": "application/json",
           "workbook-session-id": sessionId,
         },
