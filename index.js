@@ -27,6 +27,7 @@ async function importPrivateKey(pem) {
   const pemBody = pem
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\\n/g, "")
     .replace(/[\r\n\s]/g, "");
   const binary = atob(pemBody);
   const buf = new Uint8Array(binary.length);
