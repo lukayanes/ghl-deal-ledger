@@ -1,74 +1,81 @@
 /**
- * GHL Deal Ledger Worker — Webhook Edition
+ * GHL Deal Ledger Worker — Google Sheets Edition
  *
  * Receives a webhook POST from GoHighLevel when a contract is signed,
  * extracts deal data from the contact's custom fields, and inserts a
- * new row at row 4 (top of data) of the Summit Group Deal Ledger on SharePoint.
+ * new row at row 4 (top of data) of the Summit Group Deal Ledger on Google Sheets.
  *
  * ZERO external dependencies — deploys as a single file.
+ *
+ * Required env vars:
+ *   GOOGLE_CLIENT_EMAIL  — service account email
+ *   GOOGLE_PRIVATE_KEY   — PEM private key (RS256)
+ *   SPREADSHEET_ID       — Google Sheets spreadsheet ID
+ *   SHEET_NAME           — worksheet tab name (default: "Deal Ledger")
  */
 
-// ─── Microsoft Graph Auth ────────────────────────────────────────────────────
+// ─── Google Service Account Auth (JWT → Access Token) ───────────────────────
 
-async function getAccessToken(env) {
-  const cached = await env.GHL_KV.get("ms_access_token");
+function base64url(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function importPrivateKey(pem) {
+  const pemBody = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/[\r\n\s]/g, "");
+  const binary = atob(pemBody);
+  const buf = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
+  return crypto.subtle.importKey(
+    "pkcs8", buf.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false, ["sign"]
+  );
+}
+
+async function getGoogleAccessToken(env) {
+  const cached = await env.GHL_KV.get("google_access_token");
   if (cached) return cached;
 
-  const tokenUrl = `https://login.microsoftonline.com/${env.AZURE_TENANT_ID}/oauth2/v2.0/token`;
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: env.GOOGLE_CLIENT_EMAIL,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
 
-  const body = new URLSearchParams({
-    client_id: env.AZURE_CLIENT_ID,
-    client_secret: env.AZURE_CLIENT_SECRET,
-    scope: "https://graph.microsoft.com/.default",
-    grant_type: "client_credentials",
-  });
+  const enc = new TextEncoder();
+  const headerB64 = base64url(enc.encode(JSON.stringify(header)));
+  const payloadB64 = base64url(enc.encode(JSON.stringify(payload)));
+  const unsignedToken = headerB64 + "." + payloadB64;
 
-  const res = await fetch(tokenUrl, {
+  const key = await importPrivateKey(env.GOOGLE_PRIVATE_KEY);
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc.encode(unsignedToken));
+  const jwt = unsignedToken + "." + base64url(sig);
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
+    body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" + jwt,
   });
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Token request failed (${res.status}): ${text}`);
+    throw new Error("Google token request failed (" + res.status + "): " + text);
   }
 
   const data = await res.json();
   const ttl = Math.max((data.expires_in || 3600) - 120, 60);
-  await env.GHL_KV.put("ms_access_token", data.access_token, { expirationTtl: ttl });
+  await env.GHL_KV.put("google_access_token", data.access_token, { expirationTtl: ttl });
   return data.access_token;
-}
-
-// ─── Graph API Helpers ───────────────────────────────────────────────────────
-
-async function graphGet(token, url) {
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Graph GET failed (${res.status}): ${text}`);
-  }
-  return res.json();
-}
-
-async function graphPost(token, url, body, extraHeaders) {
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  };
-  if (extraHeaders) Object.assign(headers, extraHeaders);
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Graph POST failed (${res.status}): ${text}`);
-  }
-  return res.json();
 }
 
 // ─── Deal Type Detection ────────────────────────────────────────────────────
@@ -137,7 +144,7 @@ function formatMonthYear(val) {
   if (!d) return "";
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
   const yy = String(d.getUTCFullYear()).slice(-2);
-  return mm + "/" + yy;
+  return mm + "-" + yy;
 }
 
 // ─── Extract Deal from Webhook Payload ──────────────────────────────────────
@@ -249,72 +256,68 @@ function extractDeal(payload) {
 // ─── Row Builder ─────────────────────────────────────────────────────────────
 
 function dealToRow(deal) {
-  return [[
+  return [
     deal.dealId, deal.propertyAddress, deal.market, deal.acqOwner,
     deal.dispositionOwner, deal.dealStatus, deal.strategy, deal.exitType,
     deal.underContractDate, deal.closeDateActualEst, deal.month, deal.contractPrice,
     deal.listedPostedPrice, deal.buyerPriceSalePrice, deal.repairs,
     deal.potentialProfit, deal.finalProfit, deal.notes,
-  ]];
+  ];
 }
 
-// ─── Write to SharePoint ────────────────────────────────────────────────────
+// ─── Write to Google Sheets ─────────────────────────────────────────────────
 
 async function writeToLedger(env, deal) {
-  const token = await getAccessToken(env);
+  const token = await getGoogleAccessToken(env);
+  const spreadsheetId = env.SPREADSHEET_ID;
+  const sheetName = env.SHEET_NAME || "Deal Ledger";
+  const baseUrl = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId;
+  const headers = {
+    Authorization: "Bearer " + token,
+    "Content-Type": "application/json",
+  };
 
-  const siteUrl = "https://graph.microsoft.com/v1.0/sites/" + env.SHAREPOINT_SITE_ID;
-  const workbookUrl = siteUrl + "/drive/root:/" + env.LEDGER_FILE_PATH + ":/workbook";
-  const worksheetUrl = workbookUrl + "/worksheets('" + (env.LEDGER_SHEET_NAME || "Sheet1") + "')";
-  const tableName = env.LEDGER_TABLE_NAME || "DealLedger";
-  const insertUrl = worksheetUrl + "/tables('" + tableName + "')/rows";
-
-  let sessionId = null;
-  try {
-    const session = await graphPost(token, workbookUrl + "/createSession", { persistChanges: true });
-    sessionId = session.id;
-  } catch (err) {
-    console.error("Session failed: " + err.message);
-  }
-  const sessionHeaders = sessionId ? { "workbook-session-id": sessionId } : {};
-
-  // Insert the row
-  const rowValues = dealToRow(deal);
-  await graphPost(token, insertUrl, { index: 0, values: rowValues }, sessionHeaders);
-  console.log("Row inserted: " + deal.dealId + " | " + deal.strategy);
-
-  // Format the row — white fill, blue font size 12
-  try {
-    const fmtHeaders = {
-      Authorization: "Bearer " + token,
-      "Content-Type": "application/json",
-    };
-    if (sessionId) fmtHeaders["workbook-session-id"] = sessionId;
-    await fetch(worksheetUrl + "/range(address='A4:R4')/format/fill", {
-      method: "PATCH", headers: fmtHeaders,
-      body: JSON.stringify({ color: "FFFFFF" }),
-    });
-    await fetch(worksheetUrl + "/range(address='A4:R4')/format/font", {
-      method: "PATCH", headers: fmtHeaders,
-      body: JSON.stringify({ color: "0000FF", size: 12 }),
-    });
-  } catch (_) {}
-
-  // Close session
-  if (sessionId) {
-    try {
-      await fetch(workbookUrl + "/closeSession", {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + token,
-          "Content-Type": "application/json",
-          "workbook-session-id": sessionId,
+  // Step 1: Insert a blank row at row 4 (0-indexed row 3) to push data down
+  const insertRes = await fetch(baseUrl + ":batchUpdate", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      requests: [{
+        insertDimension: {
+          range: {
+            sheetId: 0,
+            dimension: "ROWS",
+            startIndex: 3,
+            endIndex: 4,
+          },
+          inheritFromBefore: false,
         },
-        body: "{}",
-      });
-    } catch (_) {}
+      }],
+    }),
+  });
+
+  if (!insertRes.ok) {
+    const text = await insertRes.text();
+    throw new Error("Sheets insertDimension failed (" + insertRes.status + "): " + text);
   }
 
+  // Step 2: Write the deal data into row 4
+  const rowValues = dealToRow(deal);
+  const updateRes = await fetch(
+    baseUrl + "/values/" + encodeURIComponent(sheetName + "!A4:R4") + "?valueInputOption=USER_ENTERED",
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ values: [rowValues] }),
+    }
+  );
+
+  if (!updateRes.ok) {
+    const text = await updateRes.text();
+    throw new Error("Sheets values update failed (" + updateRes.status + "): " + text);
+  }
+
+  console.log("Row inserted: " + deal.dealId + " | " + deal.strategy);
   return { success: true, deal: deal.dealId, address: deal.propertyAddress, strategy: deal.strategy };
 }
 
