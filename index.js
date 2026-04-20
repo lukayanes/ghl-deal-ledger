@@ -305,7 +305,7 @@ async function writeToLedger(env, deal) {
   // Step 2: Write the deal data into row 4
   const rowValues = dealToRow(deal);
   const updateRes = await fetch(
-    baseUrl + "/values/" + encodeURIComponent(sheetName + "!A4:R4") + "?valueInputOption=USER_ENTERED",
+    baseUrl + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:R4") + "?valueInputOption=USER_ENTERED",
     {
       method: "PUT",
       headers,
