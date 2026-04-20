@@ -2,9 +2,18 @@ name = "ghl-deal-ledger"
 main = "index.js"
 compatibility_date = "2024-09-01"
 
+# No cron needed — triggered by GHL webhook POST to /webhook
+
+# KV namespace binding (for caching Google access tokens)
 [[kv_namespaces]]
 binding = "GHL_KV"
 id = "20940742c3494b98a8475665e12f63b1"
+
+# Environment variables (set via Cloudflare dashboard > Worker > Settings > Variables)
+# GOOGLE_CLIENT_EMAIL  — service account email (plain text)
+# GOOGLE_PRIVATE_KEY   — PEM private key (encrypt — set as secret)
+# SPREADSHEET_ID       — 1oLZtLSj5Mr65xGoiYy_NHrccVMiLtilkn2p1-Vb529o
+# SHEET_NAME           — Deal Ledger
 
 [observability]
 [observability.logs]
