@@ -249,6 +249,8 @@ function extractDeal(payload) {
     buyerPriceSalePrice: "",
     repairs: "",
     potentialProfit: "",
+    buyerName: "",
+    listingAgentName: "",
     finalProfit: "",
     notes: notes.join(" | "),
   };
@@ -262,7 +264,7 @@ function dealToRow(deal) {
     deal.dispositionOwner, deal.dealStatus, deal.strategy, deal.exitType,
     deal.underContractDate, deal.closeDateActualEst, deal.month, deal.contractPrice,
     deal.listedPostedPrice, deal.buyerPriceSalePrice, deal.repairs,
-    deal.potentialProfit, deal.finalProfit, deal.notes,
+    deal.potentialProfit, deal.buyerName, deal.listingAgentName, deal.finalProfit, deal.notes,
   ];
 }
 
@@ -302,10 +304,10 @@ async function writeToLedger(env, deal) {
     throw new Error("Sheets insertDimension failed (" + insertRes.status + "): " + text);
   }
 
-  // Step 2: Write the deal data into row 4
+  // Step 2: Write the deal data into row 4 (A:T = 20 columns)
   const rowValues = dealToRow(deal);
   const updateRes = await fetch(
-    baseUrl + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:R4") + "?valueInputOption=USER_ENTERED",
+    baseUrl + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:T4") + "?valueInputOption=USER_ENTERED",
     {
       method: "PUT",
       headers,
