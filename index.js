@@ -407,67 +407,94 @@ function findSellerRecipient(recipients) {
   return signer || recipients[0] || {};
 }
 
+// Helper: get a token value by name, trying exact match and a few common variants
+function getToken(tokens, ...candidates) {
+  for (const name of candidates) {
+    if (tokens[name] !== undefined && tokens[name] !== null && tokens[name] !== "") return tokens[name];
+  }
+  return "";
+}
+
+// Combine "add 1" + "add 2" style additional-terms tokens into one string
+function combineAdditionalTerms(tokens) {
+  const parts = [];
+  for (let i = 1; i <= 10; i++) {
+    const v = tokens["add " + i] || tokens["add_" + i] || tokens["additional_term_" + i] || "";
+    if (v) parts.push(v);
+  }
+  if (tokens.additional_terms) parts.push(tokens.additional_terms);
+  return parts.join(" | ");
+}
+
 // Reshape PandaDoc data into the GHL-style payload that extractDeal() expects
 function pandaDocToGHLShape(pdData) {
   const tokens = pandaDocTokensToMap(pdData.tokens || pdData.fields);
   const seller = findSellerRecipient(pdData.recipients);
 
-  // Seller name: prefer token, fallback to recipient name fields
-  let firstName = seller.first_name || "";
-  let lastName = seller.last_name || "";
-  if (tokens.seller_name && !(firstName || lastName)) {
-    const parts = String(tokens.seller_name).trim().split(/\s+/);
-    firstName = parts[0] || "";
-    lastName = parts.slice(1).join(" ");
-  }
+  // Seller info comes from the role-based recipient ([Seller.FirstName] etc.)
+  const firstName = seller.first_name || "";
+  const lastName = seller.last_name || "";
+
+  // Address — Summit uses [Seller.StreetAddress] for both seller address AND property address
+  // (typical when seller lives at the property). Fall back to recipient.street_address.
+  const sellerAddress = seller.street_address || seller.address || "";
+  const city = seller.city || "";
+  const state = seller.state || "";
+  const zip = seller.postal_code || seller.zip || "";
 
   const shape = {
     _source: "PandaDoc",
     document_name: pdData.name || "",
     first_name: firstName,
     last_name: lastName,
-    email: tokens.seller_email || seller.email || "",
-    phone: tokens.seller_phone || seller.phone || "",
-    full_address_1: tokens.property_address || tokens.seller_address || "",
+    email: seller.email || "",
+    phone: seller.phone || "",
+    address1: sellerAddress,
+    city: city,
+    state: state,
+    postal_code: zip,
+    full_address_1: sellerAddress + (city ? ", " + city : "") + (state ? ", " + state : "") + (zip ? " " + zip : ""),
   };
 
   // Detect deal type from document name
   const dealType = detectDealType({ document_name: pdData.name });
 
-  // Map tokens to deal-type-specific field names
+  // Combined additional terms ("add 1" + "add 2" → single string)
+  const additionalTerms = combineAdditionalTerms(tokens);
+
+  // Map deal-type-specific tokens (use exact PandaDoc variable names with spaces)
   if (dealType === "Novation") {
-    shape.purchase_price_novation = tokens.purchase_price || "";
-    shape.closing_date_novation = tokens.closing_date || "";
-    shape.date_completed_by_novation = tokens.acceptance_date || pdData.date_completed || "";
-    shape.time_completed_by_novation = tokens.acceptance_time || "";
-    shape.emd_novation = tokens.emd_amount || "";
-    shape.additional_terms = tokens.additional_terms || "";
+    shape.purchase_price_novation = getToken(tokens, "purchase price", "purchase_price");
+    shape.closing_date_novation = getToken(tokens, "closing date", "closing_date");
+    shape.date_completed_by_novation = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
+    shape.time_completed_by_novation = getToken(tokens, "time exp", "time_exp", "acceptance_time");
+    shape.emd_novation = getToken(tokens, "emd", "emd_amount");
+    shape.additional_terms = additionalTerms;
   } else if (dealType === "Cash") {
-    shape.purchase_price_cash = tokens.purchase_price || "";
-    shape.closing_date_cash = tokens.closing_date || "";
-    shape.date_completed_by_cash = tokens.acceptance_date || pdData.date_completed || "";
-    shape.amt_due_at_closing_cash = tokens.balance_due_at_closing || "";
-    shape.due_diligence_cash = tokens.due_diligence_days || "";
-    shape.additional_terms = tokens.additional_terms || "";
+    shape.purchase_price_cash = getToken(tokens, "purchase price", "purchase_price");
+    shape.closing_date_cash = getToken(tokens, "closing date", "closing_date");
+    shape.date_completed_by_cash = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
+    shape.amt_due_at_closing_cash = getToken(tokens, "balance due at closing", "balance_due_at_closing");
+    shape.due_diligence_cash = getToken(tokens, "due diligence days", "due_diligence_days", "due diligence");
+    shape.additional_terms = additionalTerms;
   } else if (dealType === "Subject-to") {
-    shape.total_purchase_price = tokens.purchase_price || "";
-    shape.closing_date = tokens.closing_date || "";
-    shape.date_and_time_completed_by = tokens.acceptance_date || pdData.date_completed || "";
-    shape.existing_mortgage_balance = tokens.existing_mortgage_balance || "";
-    shape.monthly_mortgage_payment = tokens.monthly_mortgage_payment || "";
-    shape.deposit = tokens.emd_amount || tokens.deposit || "";
+    shape.total_purchase_price = getToken(tokens, "purchase price", "purchase_price");
+    shape.closing_date = getToken(tokens, "closing date", "closing_date");
+    shape.date_and_time_completed_by = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
+    shape.existing_mortgage_balance = getToken(tokens, "existing mortgage balance", "existing_mortgage_balance");
+    shape.monthly_mortgage_payment = getToken(tokens, "monthly mortgage payment", "monthly_mortgage_payment");
+    shape.deposit = getToken(tokens, "emd", "emd_amount", "deposit");
   } else if (dealType === "Seller Finance") {
-    shape.total_purchase_price = tokens.purchase_price || "";
-    shape.closing_date = tokens.closing_date || "";
-    shape.date_and_time_completed_by = tokens.acceptance_date || pdData.date_completed || "";
-    shape.seller_finance_terms = tokens.seller_finance_terms || tokens.additional_terms || "";
-    shape.down_payment = tokens.down_payment || "";
-    shape.deposit = tokens.emd_amount || tokens.deposit || "";
+    shape.total_purchase_price = getToken(tokens, "purchase price", "purchase_price");
+    shape.closing_date = getToken(tokens, "closing date", "closing_date");
+    shape.date_and_time_completed_by = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
+    shape.seller_finance_terms = getToken(tokens, "seller finance terms", "seller_finance_terms") || additionalTerms;
+    shape.down_payment = getToken(tokens, "down payment", "down_payment");
+    shape.deposit = getToken(tokens, "emd", "emd_amount", "deposit");
   } else if (dealType === "Amendment") {
-    // Amendments update an existing row — for now, also create a row tagged so you can spot it.
-    shape.amendment_purchase_price = tokens.purchase_price || "";
-    shape.amendment_closing_date = tokens.closing_date || "";
-    shape.amendment__other_notes = tokens.other || tokens.additional_terms || "";
+    shape.amendment_purchase_price = getToken(tokens, "purchase price", "purchase_price");
+    shape.amendment_closing_date = getToken(tokens, "closing date", "closing_date");
+    shape.amendment__other_notes = getToken(tokens, "other", "additional_terms") || additionalTerms;
   }
 
   return { shape, dealType };
@@ -476,14 +503,17 @@ function pandaDocToGHLShape(pdData) {
 async function handlePandaDocWebhook(request, env) {
   const body = await request.text();
 
-  // Signature verification
-  const signature = request.headers.get("x-pandadoc-signature")
+  // PandaDoc sends signature as a query parameter: /pandadoc-webhook?signature=<hex>
+  // Fall back to header-based for flexibility.
+  const url = new URL(request.url);
+  const signature = url.searchParams.get("signature")
+                 || request.headers.get("x-pandadoc-signature")
                  || request.headers.get("X-PandaDoc-Signature")
                  || request.headers.get("signature");
 
   const sigValid = await verifyPandaDocSignature(signature, body, env.PANDADOC_WEBHOOK_SECRET);
   if (!sigValid) {
-    console.warn("PandaDoc webhook signature invalid");
+    console.warn("PandaDoc webhook signature invalid. Received: " + (signature || "(none)").slice(0, 16) + "... Body len: " + body.length);
     return new Response(JSON.stringify({ error: "Invalid signature" }), {
       status: 401,
       headers: { "Content-Type": "application/json" },
