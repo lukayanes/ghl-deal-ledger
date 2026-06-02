@@ -384,24 +384,46 @@ async function verifyPandaDocSignature(signatureHeader, body, secret) {
   return provided === sigHex;
 }
 
-// Convert PandaDoc tokens array → flat object keyed by token name
+// Convert PandaDoc tokens array → flat object keyed by token name.
+// Handles BOTH formats PandaDoc has used:
+//   - {"name": "x", "value": "y"}  (legacy / API v1)
+//   - {"x": "y"}                    (current webhook format — key IS the token name)
 function pandaDocTokensToMap(tokens) {
   const map = {};
   if (!Array.isArray(tokens)) return map;
   for (const t of tokens) {
-    if (t && t.name) map[t.name] = t.value;
+    if (!t || typeof t !== "object") continue;
+    // Legacy format
+    if (t.name !== undefined) {
+      map[t.name] = t.value;
+      continue;
+    }
+    // Current format — each object has one key/value pair (the token name/value)
+    for (const [k, v] of Object.entries(t)) {
+      map[k] = v;
+    }
   }
   return map;
 }
 
-// Find the primary seller recipient (first signer that isn't the owner/buyer)
+// Find the primary seller recipient.
+// Checks BOTH `role` (string) AND `roles` (array) since PandaDoc uses both.
 function findSellerRecipient(recipients) {
   if (!Array.isArray(recipients) || recipients.length === 0) return {};
-  // Prefer role match
-  const byRole = recipients.find(function(r) {
+
+  // Try roles array first (current PandaDoc format)
+  const byRolesArray = recipients.find(function(r) {
+    if (!r || !Array.isArray(r.roles)) return false;
+    return r.roles.some(function(role) { return /seller/i.test(role); });
+  });
+  if (byRolesArray) return byRolesArray;
+
+  // Try role string (legacy)
+  const byRoleString = recipients.find(function(r) {
     return r && typeof r.role === "string" && /seller\s*1|seller$/i.test(r.role);
   });
-  if (byRole) return byRole;
+  if (byRoleString) return byRoleString;
+
   // Otherwise first signer
   const signer = recipients.find(function(r) { return r && r.recipient_type === "signer"; });
   return signer || recipients[0] || {};
@@ -431,33 +453,37 @@ function pandaDocToGHLShape(pdData) {
   const tokens = pandaDocTokensToMap(pdData.tokens || pdData.fields);
   const seller = findSellerRecipient(pdData.recipients);
 
-  // Seller info comes from the role-based recipient ([Seller.FirstName] etc.)
-  const firstName = seller.first_name || "";
-  const lastName = seller.last_name || "";
+  // Seller info — prefer tokens ([Seller.FirstName] etc.) since they're always present,
+  // fall back to recipient data.
+  const firstName = tokens["Seller.FirstName"] || seller.first_name || "";
+  const lastName = tokens["Seller.LastName"] || seller.last_name || "";
 
   // Address — Summit uses [Seller.StreetAddress] for both seller address AND property address
-  // (typical when seller lives at the property). Fall back to recipient.street_address.
-  const sellerAddress = seller.street_address || seller.address || "";
-  const city = seller.city || "";
-  const state = seller.state || "";
-  const zip = seller.postal_code || seller.zip || "";
+  // (typical when seller lives at the property). Token comes as full string like
+  // "12217 S Summit St, Olathe, Kansas 66062" — let extractDeal() parse it.
+  const fullSellerAddress = tokens["Seller.StreetAddress"]
+                          || seller.street_address
+                          || seller.address
+                          || "";
 
   const shape = {
     _source: "PandaDoc",
     document_name: pdData.name || "",
+    template_name: (pdData.template && pdData.template.name) || "",
     first_name: firstName,
     last_name: lastName,
     email: seller.email || "",
     phone: seller.phone || "",
-    address1: sellerAddress,
-    city: city,
-    state: state,
-    postal_code: zip,
-    full_address_1: sellerAddress + (city ? ", " + city : "") + (state ? ", " + state : "") + (zip ? " " + zip : ""),
+    full_address_1: fullSellerAddress,
   };
 
-  // Detect deal type from document name
-  const dealType = detectDealType({ document_name: pdData.name });
+  // Detect deal type from BOTH document name and template name.
+  // Document name may be customized per-deal (e.g. "Partnership Agreement_Evans"),
+  // but the template name keeps the type keyword.
+  let dealType = detectDealType({ document_name: pdData.name });
+  if (dealType === "Unknown" && pdData.template && pdData.template.name) {
+    dealType = detectDealType({ document_name: pdData.template.name });
+  }
 
   // Combined additional terms ("add 1" + "add 2" → single string)
   const additionalTerms = combineAdditionalTerms(tokens);
