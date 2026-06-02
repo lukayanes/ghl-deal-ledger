@@ -197,6 +197,7 @@ function extractDeal(payload) {
     closingDate = formatDate(payload.closing_date_cash);
     underContractDate = formatDate(payload.date_completed_by_cash);
     balanceAtClosing = clean(payload.amt_due_at_closing_cash);
+    if (clean(payload.emd_cash) || clean(payload.emd)) earnestMoney = clean(payload.emd_cash) || clean(payload.emd);
     if (clean(payload.due_diligence_cash)) notes.push("Due Diligence: " + clean(payload.due_diligence_cash) + " days");
   } else if (dealType === "Subject-to") {
     contractPrice = formatMoney(payload.total_purchase_price);
@@ -227,6 +228,12 @@ function extractDeal(payload) {
   }
   if (clean(payload.amendment__other_notes)) {
     notes.push("Amendment Notes: " + clean(payload.amendment__other_notes));
+  }
+
+  // Add additional_terms to notes universally (not just Novation) — for PandaDoc flow
+  const alreadyHasTerms = notes.some(function(n) { return typeof n === "string" && n.indexOf("Terms:") === 0; });
+  if (clean(payload.additional_terms) && !alreadyHasTerms) {
+    notes.push("Terms: " + clean(payload.additional_terms));
   }
 
   if (earnestMoney) notes.push("EMD: " + earnestMoney);
@@ -488,39 +495,72 @@ function pandaDocToGHLShape(pdData) {
   // Combined additional terms ("add 1" + "add 2" → single string)
   const additionalTerms = combineAdditionalTerms(tokens);
 
-  // Map deal-type-specific tokens (use exact PandaDoc variable names with spaces)
+  // Helper aliases for common tokens (handles variation across Summit's templates)
+  const pp = function() { return getToken(tokens, "pp", "purchase price", "purchase_price"); };
+  const closing = function() { return getToken(tokens, "closing date", "closing_date"); };
+  const dateExp = function() { return getToken(tokens, "date ex", "date exp", "date_exp", "acceptance_date") || pdData.date_completed || ""; };
+  const timeExp = function() { return getToken(tokens, "time ex", "time exp", "time_exp", "acceptance_time"); };
+  const emd = function() { return getToken(tokens, "emd", "emd_amount", "deposit"); };
+  const balanceDue = function() { return getToken(tokens, "balance due at closing", "balance_due_at_closing"); };
+  const dueDil = function() { return getToken(tokens, "due dil", "due diligence days", "due_diligence_days", "due diligence"); };
+  const county = function() { return getToken(tokens, "county"); };
+  const titleSurvey = function() { return getToken(tokens, "title and survey", "title_and_survey"); };
+
+  // Sub-To / Seller Finance specific
+  const existingMortgage = function() { return getToken(tokens, "existing mortgage", "existing mortgage balance", "existing_mortgage_balance"); };
+  const piti = function() { return getToken(tokens, "PITI", "monthly mortgage payment", "monthly_mortgage_payment"); };
+  const yrsLeft = function() { return getToken(tokens, "Yrs", "yrs", "years_remaining_on_mortgage"); };
+  const mosLeft = function() { return getToken(tokens, "mo's", "mos", "months_remaining_on_mortgage"); };
+  const sfTerms = function() { return getToken(tokens, "seller financing terms", "seller finance terms", "seller_finance_terms"); };
+  const sfAmount = function() { return getToken(tokens, "seller financing", "seller_financing"); };
+  const downPayment = function() { return getToken(tokens, "down payment", "down_payment"); };
+
+  // Surface county and title/survey in notes if present (since the deal ledger doesn't have those columns)
+  let extraNotes = additionalTerms;
+  if (county()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "County: " + county();
+  if (titleSurvey()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "Title/Survey: " + titleSurvey() + " days";
+  if (dueDil()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "Due Diligence: " + dueDil() + " days";
+
+  // Map deal-type-specific tokens
   if (dealType === "Novation") {
-    shape.purchase_price_novation = getToken(tokens, "purchase price", "purchase_price");
-    shape.closing_date_novation = getToken(tokens, "closing date", "closing_date");
-    shape.date_completed_by_novation = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
-    shape.time_completed_by_novation = getToken(tokens, "time exp", "time_exp", "acceptance_time");
-    shape.emd_novation = getToken(tokens, "emd", "emd_amount");
-    shape.additional_terms = additionalTerms;
+    shape.purchase_price_novation = pp();
+    shape.closing_date_novation = closing();
+    shape.date_completed_by_novation = dateExp();
+    shape.time_completed_by_novation = timeExp();
+    shape.emd_novation = emd();
+    shape.additional_terms = extraNotes;
   } else if (dealType === "Cash") {
-    shape.purchase_price_cash = getToken(tokens, "purchase price", "purchase_price");
-    shape.closing_date_cash = getToken(tokens, "closing date", "closing_date");
-    shape.date_completed_by_cash = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
-    shape.amt_due_at_closing_cash = getToken(tokens, "balance due at closing", "balance_due_at_closing");
-    shape.due_diligence_cash = getToken(tokens, "due diligence days", "due_diligence_days", "due diligence");
-    shape.additional_terms = additionalTerms;
+    shape.purchase_price_cash = pp();
+    shape.closing_date_cash = closing();
+    shape.date_completed_by_cash = dateExp();
+    shape.amt_due_at_closing_cash = balanceDue();
+    shape.due_diligence_cash = dueDil();
+    shape.emd_cash = emd();
+    shape.additional_terms = extraNotes;
   } else if (dealType === "Subject-to") {
-    shape.total_purchase_price = getToken(tokens, "purchase price", "purchase_price");
-    shape.closing_date = getToken(tokens, "closing date", "closing_date");
-    shape.date_and_time_completed_by = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
-    shape.existing_mortgage_balance = getToken(tokens, "existing mortgage balance", "existing_mortgage_balance");
-    shape.monthly_mortgage_payment = getToken(tokens, "monthly mortgage payment", "monthly_mortgage_payment");
-    shape.deposit = getToken(tokens, "emd", "emd_amount", "deposit");
+    shape.total_purchase_price = pp();
+    shape.closing_date = closing();
+    shape.date_and_time_completed_by = dateExp();
+    shape.existing_mortgage_balance = existingMortgage();
+    shape.monthly_mortgage_payment = piti();
+    shape.years_remaining_on_mortgage = yrsLeft();
+    shape.months_remaining_on_mortgage = mosLeft();
+    shape.deposit = emd();
+    shape.additional_terms = extraNotes;
   } else if (dealType === "Seller Finance") {
-    shape.total_purchase_price = getToken(tokens, "purchase price", "purchase_price");
-    shape.closing_date = getToken(tokens, "closing date", "closing_date");
-    shape.date_and_time_completed_by = getToken(tokens, "date exp", "date_exp", "acceptance_date") || pdData.date_completed || "";
-    shape.seller_finance_terms = getToken(tokens, "seller finance terms", "seller_finance_terms") || additionalTerms;
-    shape.down_payment = getToken(tokens, "down payment", "down_payment");
-    shape.deposit = getToken(tokens, "emd", "emd_amount", "deposit");
+    shape.total_purchase_price = pp();
+    shape.closing_date = closing();
+    shape.date_and_time_completed_by = dateExp();
+    shape.seller_finance_terms = sfTerms() || sfAmount() || extraNotes;
+    shape.down_payment = downPayment();
+    shape.monthly_mortgage_payment = piti();
+    shape.existing_mortgage_balance = existingMortgage();
+    shape.deposit = emd();
+    shape.additional_terms = extraNotes;
   } else if (dealType === "Amendment") {
-    shape.amendment_purchase_price = getToken(tokens, "purchase price", "purchase_price");
-    shape.amendment_closing_date = getToken(tokens, "closing date", "closing_date");
-    shape.amendment__other_notes = getToken(tokens, "other", "additional_terms") || additionalTerms;
+    shape.amendment_purchase_price = pp();
+    shape.amendment_closing_date = closing();
+    shape.amendment__other_notes = getToken(tokens, "other", "additional_terms") || extraNotes;
   }
 
   return { shape, dealType };
