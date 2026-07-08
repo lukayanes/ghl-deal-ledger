@@ -1,731 +1,863 @@
-/**
- * GHL Deal Ledger Worker — Google Sheets Edition (v2: PandaDoc support)
- *
- * Endpoints:
- *   POST /webhook            — Original GHL native contract webhook
- *   POST /pandadoc-webhook   — NEW: PandaDoc signed-document webhook
- *   POST /test               — Test payload parsing without writing
- *   GET  /health             — Health check
- *
- * Required env vars:
- *   GOOGLE_CLIENT_EMAIL       — service account email
- *   GOOGLE_PRIVATE_KEY        — PEM private key (RS256)
- *   SPREADSHEET_ID            — Google Sheets spreadsheet ID
- *   SHEET_NAME                — worksheet tab name (default: "Deal Ledger")
- *   PANDADOC_WEBHOOK_SECRET   — NEW: shared secret from PandaDoc webhook subscription
- *   GHL_KV                    — KV namespace binding for Google access token cache
- */
+// ═══════════════════════════════════════════════════════════════════
+//  CALL LEDGER — Cloudflare Worker  (simplified, grouped-by-person)
+//  GHL Webhook → GHL API (recording) → Whisper → Claude → Google Sheets
+// ═══════════════════════════════════════════════════════════════════
+//
+//  Required secrets (Cloudflare > Worker > Settings > Variables & Secrets):
+//    GHL_API_KEY, GHL_LOCATION_ID, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+//    GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, GOOGLE_SHEET_ID
+//
+//  Non-secret vars: LEDGER_SHEET_NAME ("Call Ledger"), FIRST_DATA_ROW ("5")
+//
+//  Sheet columns (Call Ledger tab), data starts at FIRST_DATA_ROW:
+//    A: (your auto-number formula — untouched)
+//    B: Date            C: Seller Name     D: Phone
+//    E: Property Addr   F: City / State    G: Property Type
+//    H: Beds            I: Baths           J: Sqft
+//    K: Asking Price    L: Owed / Liens    M: Repairs Needed
+//    N: Occupancy/Access O: Motivation     P: Key Dates
+//    Q: Call Summary    R: Acq. Coaching   S: Next Steps
+//    T: Callback Date   U: Recording URL (auto — de-dupe fingerprint)
+//
+//  ORGANIZED BY PERSON:
+//    Every call is logged as its own row. A new call is inserted directly
+//    below that seller's most recent existing row (matched by phone, then
+//    name), so all of one person's calls stay grouped together. Brand-new
+//    sellers are appended at the bottom.
+//
+//  CAPTURING PRIOR CALLS:
+//    The worker collects EVERY recording on the contact (newest-first) and
+//    picks the newest one NOT already in column U. Re-trigger the webhook to
+//    back-fill an earlier call.
+//
+//  A concise summary of each call is also pushed back to the GHL contact's
+//  Notes section.
+// ═══════════════════════════════════════════════════════════════════
 
-// ─── Google Service Account Auth (JWT → Access Token) ───────────────────────
+// ── Column layout ──
+const COL = {
+  DATE: "B", NAME: "C", PHONE: "D", ADDRESS: "E", CITY_STATE: "F",
+  PROP_TYPE: "G", BEDS: "H", BATHS: "I", SQFT: "J", PRICE: "K",
+  OWED: "L", REPAIRS: "M", ACCESS: "N", MOTIVATION: "O", KEY_DATES: "P",
+  SUMMARY: "Q", COACHING: "R", NEXT_STEPS: "S", CALLBACK: "T", REC_URL: "U",
+};
+const WRITE_FIRST = "B";   // first column of the main row write
+const WRITE_LAST = "T";    // last column of the main row write (U written separately)
 
-function base64url(buf) {
-  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+    if (request.method === "GET") {
+      return json({ status: "ok", message: "Call Ledger worker is active" });
+    }
+    if (request.method === "POST") {
+      try {
+        const payload = await request.json();
+        console.log("Webhook received — queuing job:", JSON.stringify(payload).substring(0, 800));
+        await env.CALL_QUEUE.send(payload);
+        return json({ status: "queued", message: "Call processing queued" });
+      } catch (err) {
+        console.error("Worker error:", err.message, err.stack);
+        return json({ status: "error", message: err.message }, 500);
+      }
+    }
+    return json({ status: "error", message: "Method not allowed" }, 405);
+  },
+
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      try {
+        await processCall(message.body, env);
+        message.ack();
+        console.log("Queue message processed and acknowledged");
+      } catch (err) {
+        console.error("Queue processing error:", err.message, err.stack);
+        message.retry();
+      }
+    }
+  },
+};
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN PIPELINE
+// ═══════════════════════════════════════════════════════════════════
+
+async function processCall(payload, env) {
+  const contactInfo = extractContactInfo(payload);
+  console.log("Contact info:", JSON.stringify(contactInfo));
+
+  if (!contactInfo.contactId) {
+    console.log("No contact ID — writing basic info only");
+    await writeToSheet(env, contactInfo, "", {});
+    return { status: "partial", reason: "No contact ID for API lookup", seller: contactInfo.sellerName };
+  }
+
+  const ghlData = await fetchGHLCallData(contactInfo.contactId, env);
+  const callData = mergeCallData(contactInfo, ghlData);
+  console.log(`Found ${callData.allRecordingUrls.length} total recording(s) for this contact`);
+
+  // Pick the newest recording not already in the ledger.
+  if (callData.allRecordingUrls.length > 0) {
+    const processed = await getProcessedRecordingUrls(env);
+    const unprocessed = callData.allRecordingUrls.filter(
+      u => !processed.has(normalizeRecordingUrl(u))
+    );
+    console.log(`${unprocessed.length} recording(s) not yet in the ledger`);
+    if (unprocessed.length === 0) {
+      console.log("All recordings already in the ledger — nothing to do");
+      return { status: "skipped", reason: "All recordings already processed", seller: callData.sellerName };
+    }
+    callData.recordingUrl = unprocessed[0];
+  }
+  console.log("Selected recording:", callData.recordingUrl ? "FOUND" : "NONE");
+
+  // Transcribe
+  let transcript = "";
+  if (callData.recordingUrl) {
+    console.log("Transcribing recording...");
+    transcript = await transcribeRecording(callData.recordingUrl, env);
+    console.log("Transcript length:", transcript.length);
+  } else {
+    console.log("No recording URL found — skipping transcription");
+  }
+
+  // Extract with Claude
+  let aiExtracted = {};
+  if (transcript) {
+    console.log("Sending to Claude for extraction...");
+    aiExtracted = await extractCallDetails(transcript, callData, env);
+    console.log("AI extracted:", JSON.stringify(aiExtracted));
+  }
+
+  // Write to the ledger (grouped by person) + stamp recording URL
+  await writeToSheet(env, callData, transcript, aiExtracted);
+
+  // Push a concise summary note back to the GHL contact
+  if (aiExtracted.call_summary && callData.contactId) {
+    await updateGHLContactNotes(callData.contactId, callData, aiExtracted, env);
+  }
+
+  return { status: "success", seller: callData.sellerName, hasTranscript: !!transcript, hasSummary: !!aiExtracted.call_summary };
 }
 
-async function importPrivateKey(pem) {
-  const pemBody = pem
-    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
-    .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/\\n/g, "")
-    .replace(/[\r\n\s]/g, "");
-  const binary = atob(pemBody);
-  const buf = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXTRACT CONTACT INFO FROM WEBHOOK
+// ═══════════════════════════════════════════════════════════════════
+
+function extractContactInfo(payload) {
+  const contact = payload.contact || payload.Contact || payload;
+
+  const contactId = contact.id || contact.contactId || contact.contact_id ||
+                    payload.contactId || payload.contact_id || "";
+
+  const firstName = contact.firstName || contact.first_name || contact.name || "";
+  const lastName = contact.lastName || contact.last_name || "";
+  const sellerName = (firstName + " " + lastName).trim() || "Unknown Seller";
+  const phone = formatPhone(contact.phone || contact.phoneNumber || contact.phone_number || "");
+
+  const address1 = contact.address1 || contact.streetAddress || contact.street_address || "";
+  const city = contact.city || "";
+  const state = contact.state || "";
+  const postalCode = contact.postal_code || contact.postalCode || "";
+  const cityState = [city, state].filter(Boolean).join(", ") + (postalCode ? " " + postalCode : "");
+
+  const callDate = payload.dateAdded || payload.date_added || payload.timestamp ||
+                   contact.dateAdded || new Date().toISOString();
+
+  return {
+    contactId,
+    sellerName,
+    phone,
+    callDate: new Date(callDate).toISOString(),
+    propertyAddress: address1,
+    cityState: cityState.trim(),
+    askingPrice: "",
+    propertyType: "",
+    recordingUrl: "",
+    allRecordingUrls: [],
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  GHL API — Fetch contact + ALL recordings (newest-first)
+// ═══════════════════════════════════════════════════════════════════
+
+const GHL_API_BASE = "https://services.leadconnectorhq.com";
+
+// Matches audio/video recording URLs (mp4 included — GHL A2P calls are mp4).
+function isRecordingUrl(url) {
+  return /\.(mp3|mp4|m4a|wav|ogg|oga|webm|aac|mpe?g|mpga)(\?|$)/i.test(String(url || ""));
+}
+
+async function fetchGHLCallData(contactId, env) {
+  const result = {
+    sellerName: "", phone: "", propertyAddress: "", cityState: "",
+    askingPrice: "", propertyType: "", recordingUrl: "", allRecordingUrls: [],
+  };
+
+  const headers = {
+    "Authorization": "Bearer " + env.GHL_API_KEY,
+    "Version": "2021-07-28",
+  };
+
+  // 1. Contact details
+  try {
+    const resp = await fetch(`${GHL_API_BASE}/contacts/${contactId}`, { headers });
+    if (resp.ok) {
+      const data = await resp.json();
+      const c = data.contact || data;
+      result.sellerName = ((c.firstName || "") + " " + (c.lastName || "")).trim();
+      result.phone = formatPhone(c.phone || "");
+      const cf = c.customFields || c.customField || [];
+      result.propertyAddress = getCustomField(cf, ["property_address", "address", "Property Address"]);
+      result.cityState = getCustomField(cf, ["city_state", "city", "City / State", "City State"]);
+      result.askingPrice = getCustomField(cf, ["asking_price", "price", "Asking Price"]);
+      result.propertyType = getCustomField(cf, ["property_type", "Property Type"]);
+      console.log("GHL contact fetched:", result.sellerName);
+    } else {
+      console.error("GHL contact error:", resp.status, (await resp.text()).substring(0, 300));
+    }
+  } catch (err) {
+    console.error("GHL contact fetch failed:", err.message);
+  }
+
+  // 2. Conversations → ALL recording URLs
+  try {
+    const convResp = await fetch(
+      `${GHL_API_BASE}/conversations/search?contactId=${contactId}&locationId=${env.GHL_LOCATION_ID}`,
+      { headers }
+    );
+
+    if (convResp.ok) {
+      const convData = await convResp.json();
+      const conversations = convData.conversations || [];
+      const typesSeen = new Set(); // diagnostic: what message types GHL returned
+
+      for (const conv of conversations) {
+        let lastMessageId = null;
+        const MAX_PAGES = 5;
+
+        for (let page = 0; page < MAX_PAGES; page++) {
+          let msgUrl = `${GHL_API_BASE}/conversations/${conv.id}/messages?limit=20`;
+          if (lastMessageId) msgUrl += `&lastMessageId=${lastMessageId}`;
+
+          const msgResp = await fetch(msgUrl, { headers });
+          if (!msgResp.ok) {
+            console.error("GHL messages error:", msgResp.status, (await msgResp.text()).substring(0, 300));
+            break;
+          }
+
+          const msgData = await msgResp.json();
+          if (page === 0) console.log("GHL messages raw (first 600):", JSON.stringify(msgData).substring(0, 600));
+
+          const msgContainer = msgData.messages || msgData;
+          let messages = [];
+          if (msgContainer && Array.isArray(msgContainer.messages)) messages = msgContainer.messages;
+          else if (Array.isArray(msgData.messages)) messages = msgData.messages;
+          else if (Array.isArray(msgData.data)) messages = msgData.data;
+          else if (Array.isArray(msgData)) messages = msgData;
+
+          console.log(`Page ${page + 1}: ${messages.length} messages`);
+          if (messages.length === 0) break;
+
+          for (const msg of messages) {
+            if (!msg || typeof msg !== "object") continue;
+
+            // Is this a call message? GHL uses types like TYPE_CALL / "call".
+            const msgType = (msg.type || msg.messageType || msg.type_ || "").toString().toUpperCase();
+            typesSeen.add(msgType || "(none)");
+            const isCall = msgType.includes("CALL") ||
+                           msg.callDuration != null || msg.callStatus != null ||
+                           !!(msg.meta && msg.meta.call);
+
+            let foundUrl = "";
+
+            // 1) Public attachment URL (accept any recording extension, or ANY
+            //    attachment on a call message — GHL signed URLs may lack an ext).
+            const attachments = msg.attachments || [];
+            for (const att of attachments) {
+              const url = typeof att === "string" ? att : (att.url || att.href || att.link || att.fileUrl || "");
+              if (!url) continue;
+              if (isRecordingUrl(url) || isCall) { foundUrl = url; break; }
+            }
+
+            // 2) Dedicated recording fields on the message.
+            if (!foundUrl) {
+              foundUrl = msg.recordingUrl || msg.recording_url ||
+                         msg.meta?.recordingUrl || msg.meta?.recording_url ||
+                         msg.meta?.call?.recordingUrl ||
+                         (msg.call && msg.call.recordingUrl) ||
+                         msg.mediaUrl || msg.media_url || "";
+            }
+
+            // 3) GHL A2P calls: the recording is NOT in the message body — it's
+            //    behind an authenticated endpoint keyed by the call message ID.
+            //    Build that URL; transcribeRecording() downloads it with the API key.
+            if (!foundUrl && isCall && msg.id) {
+              foundUrl = `${GHL_API_BASE}/conversations/messages/${msg.id}/locations/${env.GHL_LOCATION_ID}/recording`;
+              console.log(`Call message ${msg.id} — using recording endpoint`);
+            }
+
+            if (foundUrl) {
+              const norm = normalizeRecordingUrl(foundUrl);
+              const have = result.allRecordingUrls.some(u => normalizeRecordingUrl(u) === norm);
+              if (!have) {
+                result.allRecordingUrls.push(foundUrl);
+                console.log(`Found recording #${result.allRecordingUrls.length} (page ${page + 1}):`, foundUrl.substring(0, 100));
+              }
+            }
+          }
+
+          const hasNextPage = msgContainer.nextPage === true;
+          lastMessageId = msgContainer.lastMessageId || messages[messages.length - 1]?.id;
+          if (!hasNextPage || !lastMessageId) break;
+        }
+      }
+      console.log("Message types seen:", [...typesSeen].join(", ") || "(none)");
+    } else {
+      console.error("GHL conversation search error:", convResp.status);
+    }
+
+    result.recordingUrl = result.allRecordingUrls[0] || "";
+    if (!result.recordingUrl) console.log("No recording URL found in GHL conversations");
+  } catch (err) {
+    console.error("GHL conversation search failed:", err.message);
+  }
+
+  return result;
+}
+
+function getCustomField(customFields, possibleKeys) {
+  if (Array.isArray(customFields)) {
+    for (const field of customFields) {
+      const fKey = (field.id || field.key || field.name || field.fieldKey || "").toLowerCase();
+      const fName = (field.name || field.fieldName || "").toLowerCase();
+      for (const key of possibleKeys) {
+        if (fKey === key.toLowerCase() || fName === key.toLowerCase()) {
+          return field.value || field.fieldValue || "";
+        }
+      }
+    }
+  } else if (typeof customFields === "object" && customFields !== null) {
+    for (const key of possibleKeys) {
+      for (const k of Object.keys(customFields)) {
+        if (k.toLowerCase() === key.toLowerCase()) return customFields[k];
+      }
+    }
+  }
+  return "";
+}
+
+function mergeCallData(webhookData, apiData) {
+  return {
+    contactId: webhookData.contactId,
+    sellerName: apiData.sellerName || webhookData.sellerName,
+    phone: apiData.phone || webhookData.phone,
+    callDate: webhookData.callDate,
+    propertyAddress: apiData.propertyAddress || webhookData.propertyAddress,
+    cityState: apiData.cityState || webhookData.cityState,
+    askingPrice: apiData.askingPrice || webhookData.askingPrice,
+    propertyType: apiData.propertyType || webhookData.propertyType,
+    recordingUrl: apiData.recordingUrl || webhookData.recordingUrl,
+    allRecordingUrls: apiData.allRecordingUrls || [],
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  RECORDING URL HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+function normalizeRecordingUrl(url) {
+  if (!url) return "";
+  return String(url).split("?")[0].trim();
+}
+
+async function getProcessedRecordingUrls(env) {
+  try {
+    const accessToken = await getGoogleAccessToken(env);
+    if (!accessToken) return new Set();
+
+    const sheetId = env.GOOGLE_SHEET_ID;
+    const sheetName = env.LEDGER_SHEET_NAME || "Call Ledger";
+    const firstDataRow = parseInt(env.FIRST_DATA_ROW || "5");
+
+    const resp = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetName)}!${COL.REC_URL}${firstDataRow}:${COL.REC_URL}2000`,
+      { headers: { "Authorization": "Bearer " + accessToken } }
+    );
+    if (!resp.ok) {
+      console.error("Failed to read processed URLs:", resp.status);
+      return new Set();
+    }
+    const data = await resp.json();
+    const urls = (data.values || [])
+      .map(row => (row && row[0]) || "")
+      .filter(Boolean)
+      .map(normalizeRecordingUrl);
+    console.log(`Loaded ${urls.length} previously-processed recording URL(s)`);
+    return new Set(urls);
+  } catch (err) {
+    console.error("getProcessedRecordingUrls failed:", err.message);
+    return new Set();
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TRANSCRIPTION — OpenAI Whisper
+// ═══════════════════════════════════════════════════════════════════
+
+async function transcribeRecording(recordingUrl, env) {
+  try {
+    // GHL's recording endpoint requires the API key; public signed URLs don't.
+    const isGhlApi = recordingUrl.startsWith(GHL_API_BASE);
+    const dlOpts = isGhlApi
+      ? { headers: { "Authorization": "Bearer " + env.GHL_API_KEY, "Version": "2021-07-28" } }
+      : undefined;
+
+    const audioResp = await fetch(recordingUrl, dlOpts);
+    if (!audioResp.ok) {
+      console.error("Failed to download recording:", audioResp.status, isGhlApi ? "(GHL recording endpoint — may not be ready yet)" : "");
+      return "";
+    }
+    const audioBuffer = await audioResp.arrayBuffer();
+    const sizeMB = audioBuffer.byteLength / (1024 * 1024);
+    console.log(`Recording size: ${sizeMB.toFixed(1)}MB`);
+    if (sizeMB > 25) {
+      console.error("Recording too large for Whisper (25MB limit)");
+      return "";
+    }
+
+    const contentType = audioResp.headers.get("content-type") || "audio/mpeg";
+    let ext = "mp3";
+    if (contentType.includes("mp4")) ext = "mp4";
+    else if (contentType.includes("m4a")) ext = "m4a";
+    else if (contentType.includes("wav")) ext = "wav";
+    else if (contentType.includes("ogg")) ext = "ogg";
+    else if (contentType.includes("webm")) ext = "webm";
+    else if (/\.(mp4|m4a|wav|ogg|webm)/i.test(recordingUrl)) {
+      ext = recordingUrl.match(/\.(mp4|m4a|wav|ogg|webm)/i)[1].toLowerCase();
+    }
+
+    const formData = new FormData();
+    formData.append("file", new Blob([audioBuffer], { type: contentType }), `recording.${ext}`);
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "text");
+
+    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY },
+      body: formData,
+    });
+
+    if (resp.ok) {
+      const transcript = await resp.text();
+      console.log("Whisper done:", transcript.substring(0, 150) + "...");
+      return transcript;
+    }
+    console.error("Whisper error:", (await resp.text()).substring(0, 300));
+    return "";
+  } catch (err) {
+    console.error("Transcription failed:", err.message);
+    return "";
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  AI EXTRACTION — Claude (lean: deal data + concise coaching)
+// ═══════════════════════════════════════════════════════════════════
+
+async function extractCallDetails(transcript, callData, env) {
+  try {
+    const prompt = `You are an acquisitions analyst for Summit Group Acquisitions, a real estate wholesaling company, reviewing a phone call transcript with a property seller.
+
+Pull out the concrete deal facts the acquisitions AND dispositions teams need, plus a short, practical coaching note. Be specific and factual. Quote the seller where useful. If something was NOT mentioned in the call, use an empty string "" — never guess.
+
+For context, Summit's initial (Stage 1) call should cover: motivation for selling, plans after selling, house details (beds/baths/sqft/condition), timeline, any liens/mortgage owed, asking price and whether it's negotiable, and asking for photos.
+
+Return ONLY a valid JSON object with EXACTLY these keys:
+{
+  "property_address": "street address if stated, else empty string",
+  "city_state": "city and state/zip if stated, else empty string",
+  "property_type": "SFR | Multi-Family | Condo/Townhouse | Mobile Home | Land | Commercial | Other, else empty string",
+  "beds": "number of bedrooms as a number, else empty string",
+  "baths": "number of bathrooms as a number, else empty string",
+  "sqft": "square footage, numbers only, else empty string",
+  "asking_price": "NUMBERS ONLY, no $ or commas (e.g. 250000). Convert words: 'a million'=1000000. Else empty string",
+  "amount_owed": "What is owed / any liens or payoff. Include loan balance, back taxes, HOA, second mortgages, or 'Free and clear' if stated. Else empty string",
+  "repairs_needed": "Condition and repairs mentioned: roof, HVAC, foundation, cosmetic, age of systems, known issues. Else empty string",
+  "occupancy_access": "Is it occupied, vacant, or tenant-occupied? How would we access it to show buyers (lockbox, owner present, tenant coordination, key location)? Else empty string",
+  "motivation": "Why they're selling + short read on urgency. Start with a 1-10 score then a one-line reason, e.g. '8/10 — behind on payments, relocating in 30 days'. Else empty string",
+  "key_dates": "Any dates that matter: desired close date, move-out, foreclosure/auction date, when they bought, callback time. Else empty string",
+  "call_summary": "2-3 sentence plain summary: what was discussed, what the seller wants, key takeaway.",
+  "acquisitions_coaching": "3-4 sentences MAX, practical and specific to THIS seller: (1) quick read on the seller, (2) recommended acquisition strategy — Cash / Subject-To / Seller Finance / Novation — with a one-line why, (3) the single most important thing to do or ask on the next call. No generic advice.",
+  "next_steps": "Concrete follow-up action items from this call.",
+  "callback_date": "MM/DD/YYYY if a specific callback was set, else empty string"
+}
+
+Known seller info:
+- Name: ${callData.sellerName}
+- Phone: ${callData.phone}
+- Known property address: ${callData.propertyAddress || "Unknown"}
+
+TRANSCRIPT:
+${transcript}`;
+
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 2048,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    if (resp.ok) {
+      const result = await resp.json();
+      const text = result.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    } else {
+      console.error("Claude error:", (await resp.text()).substring(0, 300));
+    }
+    return {};
+  } catch (err) {
+    console.error("AI extraction failed:", err.message);
+    return {};
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  GOOGLE SHEETS — Write, grouped by person
+// ═══════════════════════════════════════════════════════════════════
+
+async function writeToSheet(env, callData, transcript, aiExtracted) {
+  const sheetName = env.LEDGER_SHEET_NAME || "Call Ledger";
+  const firstDataRow = parseInt(env.FIRST_DATA_ROW || "5");
+
+  const accessToken = await getGoogleAccessToken(env);
+  if (!accessToken) {
+    console.error("Failed to get Google access token");
+    return;
+  }
+
+  const sheetId = env.GOOGLE_SHEET_ID;
+  const baseUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
+
+  // Read existing Name + Phone columns to figure out where this call belongs.
+  const scanResp = await fetch(
+    `${baseUrl}/values/${encodeURIComponent(sheetName)}!${COL.NAME}${firstDataRow}:${COL.PHONE}2000`,
+    { headers: { "Authorization": "Bearer " + accessToken } }
+  );
+  const scanRows = scanResp.ok ? ((await scanResp.json()).values || []) : [];
+
+  // Number of existing data rows (stop at first fully-empty row).
+  let existingCount = 0;
+  for (let i = 0; i < scanRows.length; i++) {
+    const name = (scanRows[i] && scanRows[i][0]) || "";
+    const phone = (scanRows[i] && scanRows[i][1]) || "";
+    if (!name && !phone) break;
+    existingCount = i + 1;
+  }
+  const appendRow = firstDataRow + existingCount;
+
+  // Find this seller's rows — match by phone digits first, then name.
+  const targetDigits = digitsOnly(callData.phone);
+  const targetName = (callData.sellerName || "").trim().toLowerCase();
+  let lastMatchRow = -1;
+  for (let i = 0; i < existingCount; i++) {
+    const rowName = ((scanRows[i] && scanRows[i][0]) || "").trim().toLowerCase();
+    const rowDigits = digitsOnly((scanRows[i] && scanRows[i][1]) || "");
+    const phoneMatch = targetDigits && rowDigits && targetDigits === rowDigits;
+    const nameMatch = targetName && targetName !== "unknown seller" && rowName === targetName;
+    if (phoneMatch || nameMatch) lastMatchRow = firstDataRow + i;
+  }
+
+  // Insert directly below the seller's last existing row; else append.
+  let targetRow;
+  if (lastMatchRow !== -1 && lastMatchRow + 1 < appendRow) {
+    targetRow = lastMatchRow + 1;
+    const numericSheetId = await getSheetIdByName(baseUrl, accessToken, sheetName);
+    if (numericSheetId !== null) {
+      const inserted = await insertBlankRow(baseUrl, accessToken, numericSheetId, targetRow);
+      if (!inserted) targetRow = appendRow; // fall back to append if insert failed
+    } else {
+      targetRow = appendRow;
+    }
+  } else {
+    targetRow = appendRow;
+  }
+
+  // Build the row values (B..T).
+  const address = aiExtracted.property_address || callData.propertyAddress || "";
+  const cityState = aiExtracted.city_state || callData.cityState || "";
+  const propType = aiExtracted.property_type || callData.propertyType || "";
+  const price = parseAskingPrice(aiExtracted.asking_price || callData.askingPrice || "");
+
+  const callDate = new Date(callData.callDate);
+  const dateStr = `${pad(callDate.getMonth() + 1)}/${pad(callDate.getDate())}/${callDate.getFullYear()}`;
+
+  const rowValues = [
+    dateStr,                              // B Date
+    callData.sellerName,                  // C Seller Name
+    callData.phone,                       // D Phone
+    address,                              // E Property Address
+    cityState,                            // F City / State
+    propType,                             // G Property Type
+    aiExtracted.beds || "",               // H Beds
+    aiExtracted.baths || "",              // I Baths
+    aiExtracted.sqft || "",               // J Sqft
+    price,                                // K Asking Price
+    aiExtracted.amount_owed || "",        // L Owed / Liens
+    aiExtracted.repairs_needed || "",     // M Repairs Needed
+    aiExtracted.occupancy_access || "",   // N Occupancy / Access
+    aiExtracted.motivation || "",         // O Motivation
+    aiExtracted.key_dates || "",          // P Key Dates
+    aiExtracted.call_summary || "",       // Q Call Summary
+    aiExtracted.acquisitions_coaching || "", // R Acq. Coaching
+    aiExtracted.next_steps || "",         // S Next Steps
+    aiExtracted.callback_date || "",      // T Callback Date
+  ];
+
+  const writeRange = `${sheetName}!${WRITE_FIRST}${targetRow}:${WRITE_LAST}${targetRow}`;
+  const writeResp = await fetch(
+    `${baseUrl}/values/${encodeURIComponent(writeRange)}?valueInputOption=USER_ENTERED`,
+    {
+      method: "PUT",
+      headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ values: [rowValues] }),
+    }
+  );
+  if (writeResp.ok) console.log(`Row ${targetRow} written for: ${callData.sellerName}`);
+  else console.error("Sheets write error:", await writeResp.text());
+
+  // Stamp the recording URL fingerprint into column U — only once we actually
+  // transcribed it, so a not-yet-ready recording can be re-captured on retry.
+  if (callData.recordingUrl && transcript) {
+    const urlResp = await fetch(
+      `${baseUrl}/values/${encodeURIComponent(`${sheetName}!${COL.REC_URL}${targetRow}`)}?valueInputOption=USER_ENTERED`,
+      {
+        method: "PUT",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ values: [[normalizeRecordingUrl(callData.recordingUrl)]] }),
+      }
+    );
+    if (!urlResp.ok) console.error("Recording URL write error:", await urlResp.text());
+  }
+}
+
+// Look up the numeric sheetId (gid) for a tab by title.
+async function getSheetIdByName(baseUrl, accessToken, title) {
+  try {
+    const resp = await fetch(baseUrl, { headers: { "Authorization": "Bearer " + accessToken } });
+    if (!resp.ok) return null;
+    const spreadsheet = await resp.json();
+    const sheet = (spreadsheet.sheets || []).find(s => s.properties.title === title);
+    return sheet ? sheet.properties.sheetId : null;
+  } catch (err) {
+    console.error("getSheetIdByName failed:", err.message);
+    return null;
+  }
+}
+
+// Insert one blank row above `rowNumber` (1-based), inheriting formatting/formula
+// from the row above (keeps your column-A auto-number formula intact).
+async function insertBlankRow(baseUrl, accessToken, numericSheetId, rowNumber) {
+  try {
+    const resp = await fetch(`${baseUrl}:batchUpdate`, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: [{
+          insertDimension: {
+            range: {
+              sheetId: numericSheetId,
+              dimension: "ROWS",
+              startIndex: rowNumber - 1, // zero-based; inserts above this row
+              endIndex: rowNumber,
+            },
+            inheritFromBefore: true,
+          },
+        }],
+      }),
+    });
+    if (resp.ok) return true;
+    console.error("insertBlankRow error:", (await resp.text()).substring(0, 300));
+    return false;
+  } catch (err) {
+    console.error("insertBlankRow failed:", err.message);
+    return false;
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  GOOGLE AUTH — JWT → Access Token
+// ═══════════════════════════════════════════════════════════════════
+
+async function getGoogleAccessToken(env) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: "RS256", typ: "JWT" };
+    const claimSet = {
+      iss: env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      scope: "https://www.googleapis.com/auth/spreadsheets",
+      aud: "https://oauth2.googleapis.com/token",
+      iat: now,
+      exp: now + 3600,
+    };
+    const signInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claimSet))}`;
+    const privateKey = await importPrivateKey(env.GOOGLE_PRIVATE_KEY);
+    const signature = await crypto.subtle.sign(
+      { name: "RSASSA-PKCS1-v1_5" }, privateKey, new TextEncoder().encode(signInput)
+    );
+    const jwt = `${signInput}.${base64url(signature)}`;
+
+    const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    });
+    if (tokenResp.ok) return (await tokenResp.json()).access_token;
+    console.error("Google token error:", await tokenResp.text());
+    return null;
+  } catch (err) {
+    console.error("Google auth failed:", err.message);
+    return null;
+  }
+}
+
+async function importPrivateKey(pemKey) {
+  const pem = pemKey.replace(/\\n/g, "\n");
+  const pemContents = pem
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s/g, "");
+  const binaryKey = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
   return crypto.subtle.importKey(
-    "pkcs8", buf.buffer,
+    "pkcs8", binaryKey,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false, ["sign"]
   );
 }
 
-async function getGoogleAccessToken(env) {
-  const cached = await env.GHL_KV.get("google_access_token");
-  if (cached) return cached;
-
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: env.GOOGLE_CLIENT_EMAIL,
-    scope: "https://www.googleapis.com/auth/spreadsheets",
-    aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600,
-  };
-
-  const enc = new TextEncoder();
-  const headerB64 = base64url(enc.encode(JSON.stringify(header)));
-  const payloadB64 = base64url(enc.encode(JSON.stringify(payload)));
-  const unsignedToken = headerB64 + "." + payloadB64;
-
-  const key = await importPrivateKey(env.GOOGLE_PRIVATE_KEY);
-  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc.encode(unsignedToken));
-  const jwt = unsignedToken + "." + base64url(sig);
-
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" + jwt,
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error("Google token request failed (" + res.status + "): " + text);
-  }
-
-  const data = await res.json();
-  const ttl = Math.max((data.expires_in || 3600) - 120, 60);
-  await env.GHL_KV.put("google_access_token", data.access_token, { expirationTtl: ttl });
-  return data.access_token;
+function base64url(input) {
+  const str = typeof input === "string"
+    ? btoa(input)
+    : btoa(String.fromCharCode(...new Uint8Array(input)));
+  return str.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-// ─── Deal Type Detection ────────────────────────────────────────────────────
 
-function detectDealType(payload) {
-  // Normalize: lowercase + strip all non-alphanumerics, so "Sub-To", "sub_to",
-  // "subto", "Subject To", "Sub 2" all collapse to a comparable string.
-  function n(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
-  function isSubTo(s) { const x = n(s); return x.includes("subto") || x.includes("subjectto") || x.includes("sub2"); }
-  function isSellerFin(s) { const x = n(s); return x.includes("sellerfinance") || x.includes("sellerfinancing") || x.includes("ownerfinance") || x.includes("carryback"); }
+// ═══════════════════════════════════════════════════════════════════
+//  GHL — Push a concise summary note back to the contact's Notes
+// ═══════════════════════════════════════════════════════════════════
 
-  const explicit = n(payload.deal_type || payload.dealType);
-  if (explicit.includes("novation")) return "Novation";
-  if (isSubTo(explicit)) return "Subject-to";
-  if (isSellerFin(explicit)) return "Seller Finance";
-  if (explicit.includes("cash")) return "Cash";
-
-  // Check document name AND template name. Per-deal documents are often renamed
-  // (e.g. "Agreement_Evans"), but the underlying template keeps the type keyword.
-  const both = n(payload.document_name || payload.workflow_name || payload.name) + "|" + n(payload.template_name);
-  if (both.includes("novation")) return "Novation";
-  if (isSubTo(both)) return "Subject-to";
-  if (isSellerFin(both)) return "Seller Finance";
-  if (both.includes("cash")) return "Cash";
-  if (both.includes("amendment")) return "Amendment";
-  if (both.includes("assignment")) return "Assignment";
-
-  if (payload.purchase_price_novation || payload.closing_date_novation || payload.emd_novation) return "Novation";
-  if (payload.purchase_price_cash || payload.closing_date_cash || payload.county_cash) return "Cash";
-  if (payload.seller_finance_terms) return "Seller Finance";
-  if (payload.existing_mortgage_balance || payload.monthly_mortgage_payment) return "Subject-to";
-
-  return "Unknown";
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-function clean(val) {
-  if (val === null || val === undefined) return "";
-  const s = String(val).trim();
-  if (s === "null" || s === "undefined" || s === "") return "";
-  return s;
-}
-
-function formatMoney(val) {
-  if (!val) return "";
-  const s = String(val).replace(/[^0-9.]/g, "");
-  if (!s) return "";
-  const num = parseFloat(s);
-  if (isNaN(num)) return "";
-  return "$" + num.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-}
-
-function excelSerialToDate(serial) {
-  return new Date((serial - 25569) * 86400 * 1000);
-}
-
-function parseAnyDate(val) {
-  const s = clean(val);
-  if (!s) return null;
-  const num = Number(s);
-  if (!isNaN(num) && num > 40000 && num < 60000) return excelSerialToDate(num);
-  const d = new Date(s);
-  if (!isNaN(d)) return d;
-  return null;
-}
-
-function formatDate(val) {
-  const d = parseAnyDate(val);
-  if (!d) return clean(val) || "";
-  return (d.getUTCMonth() + 1) + "/" + d.getUTCDate() + "/" + d.getUTCFullYear();
-}
-
-function formatMonthYear(val) {
-  const d = parseAnyDate(val);
-  if (!d) return "";
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const yy = String(d.getUTCFullYear()).slice(-2);
-  return mm + "-" + yy;
-}
-
-// ─── Extract Deal from Webhook Payload ──────────────────────────────────────
-
-function extractDeal(payload, knownType) {
-  const dealType = knownType || detectDealType(payload);
-
-  const firstName = clean(payload.first_name) || clean(payload.firstName) || clean(payload.contact_first_name);
-  const lastName = clean(payload.last_name) || clean(payload.lastName) || clean(payload.contact_last_name);
-  const sellerName = (firstName + " " + lastName).trim();
-
-  const fullAddress = clean(payload.full_address_1);
-  const street = clean(payload.address1) || clean(payload.street_address);
-  const city = clean(payload.city);
-  const state = clean(payload.state);
-  const zip = clean(payload.postal_code) || clean(payload.zip);
-  const propertyAddress = fullAddress || [street, city, state, zip].filter(Boolean).join(", ");
-
-  let cleanMarket = state || "";
-  if (!cleanMarket && fullAddress) {
-    const parts = fullAddress.split(",").map(function(s) { return s.trim(); });
-    if (parts.length >= 3) {
-      const stateZip = parts[parts.length - 1];
-      const stateMatch = stateZip.match(/^([A-Za-z\s]+)/);
-      if (stateMatch) cleanMarket = stateMatch[1].trim();
-    }
-  }
-
-  let contractPrice = "";
-  let closingDate = "";
-  let underContractDate = "";
-  let earnestMoney = "";
-  let existingMortgage = "";
-  let balanceAtClosing = "";
-  let notes = ["Auto-added from " + (payload._source || "GHL") + " webhook."];
-
-  if (dealType === "Novation") {
-    contractPrice = formatMoney(payload.purchase_price_novation);
-    closingDate = formatDate(payload.closing_date_novation);
-    underContractDate = formatDate(payload.date_completed_by_novation);
-    earnestMoney = clean(payload.emd_novation);
-    if (clean(payload.additional_terms)) notes.push("Terms: " + clean(payload.additional_terms));
-  } else if (dealType === "Cash") {
-    contractPrice = formatMoney(payload.purchase_price_cash);
-    closingDate = formatDate(payload.closing_date_cash);
-    underContractDate = formatDate(payload.date_completed_by_cash);
-    balanceAtClosing = clean(payload.amt_due_at_closing_cash);
-    if (clean(payload.emd_cash) || clean(payload.emd)) earnestMoney = clean(payload.emd_cash) || clean(payload.emd);
-    if (clean(payload.due_diligence_cash)) notes.push("Due Diligence: " + clean(payload.due_diligence_cash) + " days");
-  } else if (dealType === "Subject-to") {
-    contractPrice = formatMoney(payload.total_purchase_price);
-    closingDate = formatDate(payload.closing_date);
-    underContractDate = formatDate(payload.date_and_time_completed_by);
-    existingMortgage = formatMoney(payload.existing_mortgage_balance);
-    if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
-    if (clean(payload.years_remaining_on_mortgage)) notes.push("Years Remaining: " + clean(payload.years_remaining_on_mortgage));
-    if (clean(payload.months_remaining_on_mortgage)) notes.push("Months Remaining: " + clean(payload.months_remaining_on_mortgage));
-    if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
-  } else if (dealType === "Seller Finance") {
-    contractPrice = formatMoney(payload.total_purchase_price);
-    closingDate = formatDate(payload.closing_date);
-    underContractDate = formatDate(payload.date_and_time_completed_by);
-    existingMortgage = formatMoney(payload.existing_mortgage_balance);
-    if (clean(payload.seller_finance_terms)) notes.push("SF Terms: " + clean(payload.seller_finance_terms));
-    if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
-    if (clean(payload.down_payment)) notes.push("Down Payment: " + formatMoney(payload.down_payment));
-    if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
-  }
-
-  if (clean(payload.amendment_purchase_price)) {
-    contractPrice = formatMoney(payload.amendment_purchase_price);
-    notes.push("Amendment applied");
-  }
-  if (clean(payload.amendment_closing_date)) {
-    closingDate = formatDate(payload.amendment_closing_date);
-  }
-  if (clean(payload.amendment__other_notes)) {
-    notes.push("Amendment Notes: " + clean(payload.amendment__other_notes));
-  }
-
-  // Add additional_terms to notes universally (not just Novation) — for PandaDoc flow
-  const alreadyHasTerms = notes.some(function(n) { return typeof n === "string" && n.indexOf("Terms:") === 0; });
-  if (clean(payload.additional_terms) && !alreadyHasTerms) {
-    notes.push("Terms: " + clean(payload.additional_terms));
-  }
-
-  if (earnestMoney) notes.push("EMD: " + earnestMoney);
-  if (existingMortgage) notes.push("Existing Mortgage: " + existingMortgage);
-  if (balanceAtClosing) notes.push("Balance at Closing: " + balanceAtClosing);
-
-  let month = "";
-  if (underContractDate) month = formatMonthYear(underContractDate);
-
-  return {
-    dealId: sellerName || "Unknown",
-    propertyAddress,
-    market: cleanMarket || state || "",
-    acqOwner: "Brennen",
-    dispositionOwner: "Aubrey",
-    dealStatus: "Under Contract",
-    strategy: dealType,
-    exitType: "Assignment",
-    underContractDate,
-    closeDateActualEst: closingDate,
-    month,
-    contractPrice,
-    listedPostedPrice: "",
-    buyerPriceSalePrice: "",
-    repairs: "",
-    potentialProfit: "",
-    buyerName: "",
-    listingAgentName: "",
-    finalProfit: "",
-    notes: notes.join(" | "),
-  };
-}
-
-// ─── Row Builder ─────────────────────────────────────────────────────────────
-
-function dealToRow(deal) {
-  return [
-    deal.dealId, deal.propertyAddress, deal.market, deal.acqOwner,
-    deal.dispositionOwner, deal.dealStatus, deal.strategy, deal.exitType,
-    deal.underContractDate, deal.closeDateActualEst, deal.month, deal.contractPrice,
-    deal.listedPostedPrice, deal.buyerPriceSalePrice, deal.repairs,
-    deal.potentialProfit, deal.buyerName, deal.listingAgentName, deal.finalProfit, deal.notes,
-  ];
-}
-
-// ─── Write to Google Sheets ─────────────────────────────────────────────────
-
-async function writeToLedger(env, deal) {
-  const token = await getGoogleAccessToken(env);
-  const spreadsheetId = env.SPREADSHEET_ID;
-  const sheetName = env.SHEET_NAME || "Deal Ledger";
-  const baseUrl = "https://sheets.googleapis.com/v4/spreadsheets/" + spreadsheetId;
-  const headers = {
-    Authorization: "Bearer " + token,
-    "Content-Type": "application/json",
-  };
-
-  // Step 1: Insert a blank row at row 4 (0-indexed row 3) to push data down
-  const insertRes = await fetch(baseUrl + ":batchUpdate", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      requests: [{
-        insertDimension: {
-          range: {
-            sheetId: 0,
-            dimension: "ROWS",
-            startIndex: 3,
-            endIndex: 4,
-          },
-          inheritFromBefore: false,
-        },
-      }],
-    }),
-  });
-
-  if (!insertRes.ok) {
-    const text = await insertRes.text();
-    throw new Error("Sheets insertDimension failed (" + insertRes.status + "): " + text);
-  }
-
-  // Step 2: Write the deal data into row 4 (A:T = 20 columns)
-  const rowValues = dealToRow(deal);
-  const updateRes = await fetch(
-    baseUrl + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:T4") + "?valueInputOption=USER_ENTERED",
-    {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ values: [rowValues] }),
-    }
-  );
-
-  if (!updateRes.ok) {
-    const text = await updateRes.text();
-    throw new Error("Sheets values update failed (" + updateRes.status + "): " + text);
-  }
-
-  console.log("Row inserted: " + deal.dealId + " | " + deal.strategy);
-  return { success: true, deal: deal.dealId, address: deal.propertyAddress, strategy: deal.strategy };
-}
-
-// ─── Flatten nested GHL payload ─────────────────────────────────────────────
-
-function flattenPayload(raw) {
-  const flat = {};
-
-  function merge(obj) {
-    if (!obj || typeof obj !== "object") return;
-    for (const [key, val] of Object.entries(obj)) {
-      if (val && typeof val === "object" && !Array.isArray(val) && key !== "customData") {
-        merge(val);
-      } else {
-        flat[key] = val;
-      }
-    }
-  }
-
-  merge(raw);
-
-  if (Array.isArray(raw.customData)) {
-    for (const item of raw.customData) {
-      if (item.field_key && item.value !== undefined) flat[item.field_key] = item.value;
-    }
-  }
-  if (raw.contact && Array.isArray(raw.contact.customData)) {
-    for (const item of raw.contact.customData) {
-      if (item.field_key && item.value !== undefined) flat[item.field_key] = item.value;
-    }
-  }
-
-  return flat;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// NEW: PandaDoc Webhook Handler
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Verify PandaDoc HMAC signature
-async function verifyPandaDocSignature(signatureHeader, body, secret) {
-  if (!signatureHeader || !secret) return false;
-
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
-  const sigHex = Array.from(new Uint8Array(sig))
-    .map(function(b) { return b.toString(16).padStart(2, "0"); })
-    .join("");
-
-  // Allow signature header to be raw hex OR "sha256=hex" prefixed
-  const provided = signatureHeader.replace(/^sha256=/i, "").trim();
-  return provided === sigHex;
-}
-
-// Convert PandaDoc tokens array → flat object keyed by token name.
-// Handles BOTH formats PandaDoc has used:
-//   - {"name": "x", "value": "y"}  (legacy / API v1)
-//   - {"x": "y"}                    (current webhook format — key IS the token name)
-function pandaDocTokensToMap(tokens) {
-  const map = {};
-  if (!Array.isArray(tokens)) return map;
-  for (const t of tokens) {
-    if (!t || typeof t !== "object") continue;
-    // Legacy format
-    if (t.name !== undefined) {
-      map[t.name] = t.value;
-      continue;
-    }
-    // Current format — each object has one key/value pair (the token name/value)
-    for (const [k, v] of Object.entries(t)) {
-      map[k] = v;
-    }
-  }
-  return map;
-}
-
-// Find the primary seller recipient.
-// Checks BOTH `role` (string) AND `roles` (array) since PandaDoc uses both.
-function findSellerRecipient(recipients) {
-  if (!Array.isArray(recipients) || recipients.length === 0) return {};
-
-  // Try roles array first (current PandaDoc format)
-  const byRolesArray = recipients.find(function(r) {
-    if (!r || !Array.isArray(r.roles)) return false;
-    return r.roles.some(function(role) { return /seller/i.test(role); });
-  });
-  if (byRolesArray) return byRolesArray;
-
-  // Try role string (legacy)
-  const byRoleString = recipients.find(function(r) {
-    return r && typeof r.role === "string" && /seller\s*1|seller$/i.test(r.role);
-  });
-  if (byRoleString) return byRoleString;
-
-  // Otherwise first signer
-  const signer = recipients.find(function(r) { return r && r.recipient_type === "signer"; });
-  return signer || recipients[0] || {};
-}
-
-// Helper: get a token value by name. Tries an exact match first, then a
-// normalized match (case-, space-, underscore-, and punctuation-insensitive)
-// so "Purchase Price", "purchase_price", and "purchaseprice" all resolve.
-function getToken(tokens, ...candidates) {
-  for (const name of candidates) {
-    if (tokens[name] !== undefined && tokens[name] !== null && tokens[name] !== "") return tokens[name];
-  }
-  const norm = function (s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); };
-  const normMap = {};
-  for (const [k, v] of Object.entries(tokens)) {
-    const nk = norm(k);
-    if (normMap[nk] === undefined || normMap[nk] === null || normMap[nk] === "") normMap[nk] = v;
-  }
-  for (const name of candidates) {
-    const v = normMap[norm(name)];
-    if (v !== undefined && v !== null && v !== "") return v;
-  }
-  return "";
-}
-
-// Combine "add 1" + "add 2" style additional-terms tokens into one string
-function combineAdditionalTerms(tokens) {
-  const parts = [];
-  for (let i = 1; i <= 10; i++) {
-    const v = tokens["add " + i] || tokens["add_" + i] || tokens["additional_term_" + i] || "";
-    if (v) parts.push(v);
-  }
-  if (tokens.additional_terms) parts.push(tokens.additional_terms);
-  return parts.join(" | ");
-}
-
-// Reshape PandaDoc data into the GHL-style payload that extractDeal() expects
-function pandaDocToGHLShape(pdData) {
-  const tokens = pandaDocTokensToMap(pdData.tokens || pdData.fields);
-  const seller = findSellerRecipient(pdData.recipients);
-
-  // Seller info — prefer tokens ([Seller.FirstName] etc.) since they're always present,
-  // fall back to recipient data.
-  const firstName = getToken(tokens, "Seller.FirstName", "seller first name", "first name", "firstname") || seller.first_name || "";
-  const lastName = getToken(tokens, "Seller.LastName", "seller last name", "last name", "lastname") || seller.last_name || "";
-
-  // Address — Summit uses [Seller.StreetAddress] for both seller address AND property address
-  // (typical when seller lives at the property). Token comes as full string like
-  // "12217 S Summit St, Olathe, Kansas 66062" — let extractDeal() parse it.
-  const fullSellerAddress = getToken(tokens, "Seller.StreetAddress", "seller street address", "property address", "street address", "address")
-                          || seller.street_address
-                          || seller.address
-                          || "";
-
-  const shape = {
-    _source: "PandaDoc",
-    document_name: pdData.name || "",
-    template_name: (pdData.template && pdData.template.name) || "",
-    first_name: firstName,
-    last_name: lastName,
-    email: seller.email || "",
-    phone: seller.phone || "",
-    full_address_1: fullSellerAddress,
-  };
-
-  // Detect deal type from BOTH document name and template name.
-  // Document name may be customized per-deal (e.g. "Partnership Agreement_Evans"),
-  // but the template name keeps the type keyword.
-  let dealType = detectDealType({ document_name: pdData.name });
-  if (dealType === "Unknown" && pdData.template && pdData.template.name) {
-    dealType = detectDealType({ document_name: pdData.template.name });
-  }
-
-  // Combined additional terms ("add 1" + "add 2" → single string)
-  const additionalTerms = combineAdditionalTerms(tokens);
-
-  // Helper aliases for common tokens (handles variation across Summit's templates)
-  const pp = function() { return getToken(tokens, "pp", "purchase price", "purchase_price", "total purchase price", "total price", "contract price", "sales price", "sale price", "price"); };
-  const closing = function() { return getToken(tokens, "closing date", "closing_date", "close date", "estimated closing date"); };
-  const dateExp = function() { return getToken(tokens, "date ex", "date exp", "date_exp", "acceptance_date") || pdData.date_completed || ""; };
-  const timeExp = function() { return getToken(tokens, "time ex", "time exp", "time_exp", "acceptance_time"); };
-  const emd = function() { return getToken(tokens, "emd", "emd_amount", "deposit"); };
-  const balanceDue = function() { return getToken(tokens, "balance due at closing", "balance_due_at_closing"); };
-  const dueDil = function() { return getToken(tokens, "due dil", "due diligence days", "due_diligence_days", "due diligence"); };
-  const county = function() { return getToken(tokens, "county"); };
-  const titleSurvey = function() { return getToken(tokens, "title and survey", "title_and_survey"); };
-
-  // Sub-To / Seller Finance specific
-  const existingMortgage = function() { return getToken(tokens, "existing mortgage", "existing mortgage balance", "existing_mortgage_balance"); };
-  const piti = function() { return getToken(tokens, "PITI", "monthly mortgage payment", "monthly_mortgage_payment"); };
-  const yrsLeft = function() { return getToken(tokens, "Yrs", "yrs", "years_remaining_on_mortgage"); };
-  const mosLeft = function() { return getToken(tokens, "mo's", "mos", "months_remaining_on_mortgage"); };
-  const sfTerms = function() { return getToken(tokens, "seller financing terms", "seller finance terms", "seller_finance_terms"); };
-  const sfAmount = function() { return getToken(tokens, "seller financing", "seller_financing"); };
-  const downPayment = function() { return getToken(tokens, "down payment", "down_payment"); };
-
-  // Surface county and title/survey in notes if present (since the deal ledger doesn't have those columns)
-  let extraNotes = additionalTerms;
-  if (county()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "County: " + county();
-  if (titleSurvey()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "Title/Survey: " + titleSurvey() + " days";
-  if (dueDil()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "Due Diligence: " + dueDil() + " days";
-
-  // Map deal-type-specific tokens
-  if (dealType === "Novation") {
-    shape.purchase_price_novation = pp();
-    shape.closing_date_novation = closing();
-    shape.date_completed_by_novation = dateExp();
-    shape.time_completed_by_novation = timeExp();
-    shape.emd_novation = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Cash") {
-    shape.purchase_price_cash = pp();
-    shape.closing_date_cash = closing();
-    shape.date_completed_by_cash = dateExp();
-    shape.amt_due_at_closing_cash = balanceDue();
-    shape.due_diligence_cash = dueDil();
-    shape.emd_cash = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Subject-to") {
-    shape.total_purchase_price = pp();
-    shape.closing_date = closing();
-    shape.date_and_time_completed_by = dateExp();
-    shape.existing_mortgage_balance = existingMortgage();
-    shape.monthly_mortgage_payment = piti();
-    shape.years_remaining_on_mortgage = yrsLeft();
-    shape.months_remaining_on_mortgage = mosLeft();
-    shape.deposit = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Seller Finance") {
-    shape.total_purchase_price = pp();
-    shape.closing_date = closing();
-    shape.date_and_time_completed_by = dateExp();
-    shape.seller_finance_terms = sfTerms() || sfAmount() || extraNotes;
-    shape.down_payment = downPayment();
-    shape.monthly_mortgage_payment = piti();
-    shape.existing_mortgage_balance = existingMortgage();
-    shape.deposit = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Amendment") {
-    shape.amendment_purchase_price = pp();
-    shape.amendment_closing_date = closing();
-    shape.amendment__other_notes = getToken(tokens, "other", "additional_terms") || extraNotes;
-  }
-
-  return { shape, dealType };
-}
-
-async function handlePandaDocWebhook(request, env) {
-  const body = await request.text();
-
-  // PandaDoc sends signature as a query parameter: /pandadoc-webhook?signature=<hex>
-  // Fall back to header-based for flexibility.
-  const url = new URL(request.url);
-  const signature = url.searchParams.get("signature")
-                 || request.headers.get("x-pandadoc-signature")
-                 || request.headers.get("X-PandaDoc-Signature")
-                 || request.headers.get("signature");
-
-  const sigValid = await verifyPandaDocSignature(signature, body, env.PANDADOC_WEBHOOK_SECRET);
-  if (!sigValid) {
-    console.warn("PandaDoc webhook signature invalid. Received: " + (signature || "(none)").slice(0, 16) + "... Body len: " + body.length);
-    return new Response(JSON.stringify({ error: "Invalid signature" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // PandaDoc sends an array of events
-  let events;
+async function updateGHLContactNotes(contactId, callData, aiExtracted, env) {
   try {
-    const parsed = JSON.parse(body);
-    events = Array.isArray(parsed) ? parsed : [parsed];
-  } catch (err) {
-    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
+    const headers = {
+      "Authorization": "Bearer " + env.GHL_API_KEY,
+      "Version": "2021-07-28",
+      "Content-Type": "application/json",
+    };
+    const callDate = new Date(callData.callDate);
+    const dateStr = callDate.toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
+
+    const noteBody = [
+      `CALL — ${dateStr}`,
+      ``,
+      `Summary: ${aiExtracted.call_summary || "N/A"}`,
+      aiExtracted.motivation ? `Motivation: ${aiExtracted.motivation}` : "",
+      aiExtracted.asking_price ? `Asking: ${aiExtracted.asking_price}` : "",
+      aiExtracted.amount_owed ? `Owed/Liens: ${aiExtracted.amount_owed}` : "",
+      aiExtracted.repairs_needed ? `Repairs: ${aiExtracted.repairs_needed}` : "",
+      aiExtracted.occupancy_access ? `Occupancy/Access: ${aiExtracted.occupancy_access}` : "",
+      aiExtracted.key_dates ? `Key Dates: ${aiExtracted.key_dates}` : "",
+      ``,
+      aiExtracted.acquisitions_coaching ? `Coaching: ${aiExtracted.acquisitions_coaching}` : "",
+      ``,
+      `Next Steps: ${aiExtracted.next_steps || "N/A"}`,
+      aiExtracted.callback_date ? `Callback: ${aiExtracted.callback_date}` : "",
+    ].filter(line => line !== "").join("\n");
+
+    const noteResp = await fetch(`${GHL_API_BASE}/contacts/${contactId}/notes`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ body: noteBody }),
     });
+    if (noteResp.ok) console.log("GHL note created for:", callData.sellerName);
+    else console.error("GHL note error:", noteResp.status, (await noteResp.text()).substring(0, 300));
+  } catch (err) {
+    console.error("GHL note creation failed:", err.message);
   }
+}
 
-  const results = [];
-  for (const ev of events) {
-    try {
-      const eventType = ev.event || ev.event_type || "";
-      const data = ev.data || ev;
-      const status = (data.status || "").toLowerCase();
 
-      // Only act on signed/completed documents
-      const isCompleted = status === "document.completed"
-                       || status === "completed"
-                       || eventType === "document_state_changed" && status === "document.completed";
+// ═══════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════
 
-      if (!isCompleted) {
-        results.push({ skipped: true, reason: "Not a completion event", event: eventType, status });
-        continue;
-      }
+function digitsOnly(s) {
+  const d = String(s || "").replace(/\D/g, "");
+  return d.length === 11 && d.startsWith("1") ? d.substring(1) : d;
+}
 
-      const { shape, dealType } = pandaDocToGHLShape(data);
+function pad(n) { return n.toString().padStart(2, "0"); }
 
-      // Amendment / Assignment: skip writing a new row (they modify existing deals)
-      if (dealType === "Amendment" || dealType === "Assignment") {
-        results.push({ skipped: true, reason: dealType + " — update logic not yet implemented", documentName: data.name });
-        continue;
-      }
-
-      if (dealType === "Unknown") {
-        results.push({ skipped: true, reason: "Unknown deal type from document name", documentName: data.name });
-        continue;
-      }
-
-      const deal = extractDeal(shape, dealType);
-      console.log("PandaDoc deal: " + deal.dealId + " | " + deal.strategy + " | " + deal.contractPrice);
-
-      const result = await writeToLedger(env, deal);
-      results.push(result);
-    } catch (err) {
-      console.error("PandaDoc event error: " + err.message);
-      results.push({ error: err.message });
-    }
+function formatPhone(raw) {
+  if (!raw) return "";
+  let digits = raw.replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) digits = digits.substring(1);
+  if (digits.length === 10) {
+    return `(${digits.substring(0, 3)}) ${digits.substring(3, 6)}-${digits.substring(6)}`;
   }
+  return raw;
+}
 
-  return new Response(JSON.stringify({ results }), {
-    headers: { "Content-Type": "application/json" },
+function parseAskingPrice(raw) {
+  if (!raw) return "";
+  const str = String(raw).trim();
+  const direct = parseFloat(str.replace(/[$,\s]/g, ""));
+  if (!isNaN(direct) && direct > 0) return direct;
+
+  const lower = str.toLowerCase();
+  const multipliers = {
+    "million": 1000000, "mil": 1000000, "m": 1000000,
+    "thousand": 1000, "k": 1000, "hundred thousand": 100000,
+  };
+  for (const [word, mult] of Object.entries(multipliers)) {
+    const match = lower.match(new RegExp(`([\\d.]+)?\\s*${word}`, "i"));
+    if (match) return (match[1] ? parseFloat(match[1]) : 1) * mult;
+  }
+  if (lower.includes("million")) return 1000000;
+  if (lower.includes("hundred thousand")) return 100000;
+  return str;
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// END NEW PandaDoc handler
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ─── Worker Entry Points ─────────────────────────────────────────────────────
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok", time: new Date().toISOString() }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    // ── Existing GHL native contract webhook ──
-    if (url.pathname === "/webhook" && request.method === "POST") {
-      try {
-        const rawPayload = await request.json();
-        console.log("GHL Webhook received: " + Object.keys(rawPayload).join(", "));
-
-        const payload = flattenPayload(rawPayload);
-        const deal = extractDeal(payload);
-        console.log("Deal: " + deal.dealId + " | " + deal.strategy + " | " + deal.contractPrice);
-
-        const result = await writeToLedger(env, deal);
-
-        return new Response(JSON.stringify(result), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        console.error("Webhook error: " + err.message);
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // ── NEW: PandaDoc webhook ──
-    if (url.pathname === "/pandadoc-webhook" && request.method === "POST") {
-      return await handlePandaDocWebhook(request, env);
-    }
-
-    // ── Test endpoint (no write) ──
-    if (url.pathname === "/test" && request.method === "POST") {
-      try {
-        const rawPayload = await request.json();
-        const payload = flattenPayload(rawPayload);
-        const deal = extractDeal(payload);
-        return new Response(JSON.stringify({ deal, row: dealToRow(deal) }, null, 2), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    return new Response("GHL Deal Ledger Worker v2. POST to /webhook (GHL) or /pandadoc-webhook (PandaDoc).", { status: 200 });
-  },
-};
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
