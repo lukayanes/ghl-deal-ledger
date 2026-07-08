@@ -84,19 +84,27 @@ async function getGoogleAccessToken(env) {
 // ─── Deal Type Detection ────────────────────────────────────────────────────
 
 function detectDealType(payload) {
-  const explicit = (payload.deal_type || payload.dealType || "").toLowerCase();
-  if (explicit.includes("novation")) return "Novation";
-  if (explicit.includes("cash")) return "Cash";
-  if (explicit.includes("sub to") || explicit.includes("sub_to") || explicit.includes("sub-to") || explicit.includes("subject to") || explicit.includes("subject-to")) return "Subject-to";
-  if (explicit.includes("seller finance") || explicit.includes("seller_finance")) return "Seller Finance";
+  // Normalize: lowercase + strip all non-alphanumerics, so "Sub-To", "sub_to",
+  // "subto", "Subject To", "Sub 2" all collapse to a comparable string.
+  function n(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
+  function isSubTo(s) { const x = n(s); return x.includes("subto") || x.includes("subjectto") || x.includes("sub2"); }
+  function isSellerFin(s) { const x = n(s); return x.includes("sellerfinance") || x.includes("sellerfinancing") || x.includes("ownerfinance") || x.includes("carryback"); }
 
-  const docName = (payload.document_name || payload.workflow_name || payload.name || "").toLowerCase();
-  if (docName.includes("novation")) return "Novation";
-  if (docName.includes("cash")) return "Cash";
-  if (docName.includes("sub to") || docName.includes("sub_to") || docName.includes("sub-to") || docName.includes("subject to") || docName.includes("subject-to")) return "Subject-to";
-  if (docName.includes("seller finance") || docName.includes("seller_finance")) return "Seller Finance";
-  if (docName.includes("amendment")) return "Amendment";
-  if (docName.includes("assignment")) return "Assignment";
+  const explicit = n(payload.deal_type || payload.dealType);
+  if (explicit.includes("novation")) return "Novation";
+  if (isSubTo(explicit)) return "Subject-to";
+  if (isSellerFin(explicit)) return "Seller Finance";
+  if (explicit.includes("cash")) return "Cash";
+
+  // Check document name AND template name. Per-deal documents are often renamed
+  // (e.g. "Agreement_Evans"), but the underlying template keeps the type keyword.
+  const both = n(payload.document_name || payload.workflow_name || payload.name) + "|" + n(payload.template_name);
+  if (both.includes("novation")) return "Novation";
+  if (isSubTo(both)) return "Subject-to";
+  if (isSellerFin(both)) return "Seller Finance";
+  if (both.includes("cash")) return "Cash";
+  if (both.includes("amendment")) return "Amendment";
+  if (both.includes("assignment")) return "Assignment";
 
   if (payload.purchase_price_novation || payload.closing_date_novation || payload.emd_novation) return "Novation";
   if (payload.purchase_price_cash || payload.closing_date_cash || payload.county_cash) return "Cash";
@@ -154,8 +162,8 @@ function formatMonthYear(val) {
 
 // ─── Extract Deal from Webhook Payload ──────────────────────────────────────
 
-function extractDeal(payload) {
-  const dealType = detectDealType(payload);
+function extractDeal(payload, knownType) {
+  const dealType = knownType || detectDealType(payload);
 
   const firstName = clean(payload.first_name) || clean(payload.firstName) || clean(payload.contact_first_name);
   const lastName = clean(payload.last_name) || clean(payload.lastName) || clean(payload.contact_last_name);
@@ -436,10 +444,22 @@ function findSellerRecipient(recipients) {
   return signer || recipients[0] || {};
 }
 
-// Helper: get a token value by name, trying exact match and a few common variants
+// Helper: get a token value by name. Tries an exact match first, then a
+// normalized match (case-, space-, underscore-, and punctuation-insensitive)
+// so "Purchase Price", "purchase_price", and "purchaseprice" all resolve.
 function getToken(tokens, ...candidates) {
   for (const name of candidates) {
     if (tokens[name] !== undefined && tokens[name] !== null && tokens[name] !== "") return tokens[name];
+  }
+  const norm = function (s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); };
+  const normMap = {};
+  for (const [k, v] of Object.entries(tokens)) {
+    const nk = norm(k);
+    if (normMap[nk] === undefined || normMap[nk] === null || normMap[nk] === "") normMap[nk] = v;
+  }
+  for (const name of candidates) {
+    const v = normMap[norm(name)];
+    if (v !== undefined && v !== null && v !== "") return v;
   }
   return "";
 }
@@ -462,13 +482,13 @@ function pandaDocToGHLShape(pdData) {
 
   // Seller info — prefer tokens ([Seller.FirstName] etc.) since they're always present,
   // fall back to recipient data.
-  const firstName = tokens["Seller.FirstName"] || seller.first_name || "";
-  const lastName = tokens["Seller.LastName"] || seller.last_name || "";
+  const firstName = getToken(tokens, "Seller.FirstName", "seller first name", "first name", "firstname") || seller.first_name || "";
+  const lastName = getToken(tokens, "Seller.LastName", "seller last name", "last name", "lastname") || seller.last_name || "";
 
   // Address — Summit uses [Seller.StreetAddress] for both seller address AND property address
   // (typical when seller lives at the property). Token comes as full string like
   // "12217 S Summit St, Olathe, Kansas 66062" — let extractDeal() parse it.
-  const fullSellerAddress = tokens["Seller.StreetAddress"]
+  const fullSellerAddress = getToken(tokens, "Seller.StreetAddress", "seller street address", "property address", "street address", "address")
                           || seller.street_address
                           || seller.address
                           || "";
@@ -496,8 +516,8 @@ function pandaDocToGHLShape(pdData) {
   const additionalTerms = combineAdditionalTerms(tokens);
 
   // Helper aliases for common tokens (handles variation across Summit's templates)
-  const pp = function() { return getToken(tokens, "pp", "purchase price", "purchase_price"); };
-  const closing = function() { return getToken(tokens, "closing date", "closing_date"); };
+  const pp = function() { return getToken(tokens, "pp", "purchase price", "purchase_price", "total purchase price", "total price", "contract price", "sales price", "sale price", "price"); };
+  const closing = function() { return getToken(tokens, "closing date", "closing_date", "close date", "estimated closing date"); };
   const dateExp = function() { return getToken(tokens, "date ex", "date exp", "date_exp", "acceptance_date") || pdData.date_completed || ""; };
   const timeExp = function() { return getToken(tokens, "time ex", "time exp", "time_exp", "acceptance_time"); };
   const emd = function() { return getToken(tokens, "emd", "emd_amount", "deposit"); };
@@ -628,7 +648,7 @@ async function handlePandaDocWebhook(request, env) {
         continue;
       }
 
-      const deal = extractDeal(shape);
+      const deal = extractDeal(shape, dealType);
       console.log("PandaDoc deal: " + deal.dealId + " | " + deal.strategy + " | " + deal.contractPrice);
 
       const result = await writeToLedger(env, deal);
