@@ -1,11 +1,4 @@
-# wrangler.toml for the GHL Deal Ledger Worker
-# Optional — only needed if you want to deploy from the CLI (`wrangler deploy`)
-# instead of pasting into the Cloudflare dashboard.
-#
-# To use: rename this file to `wrangler.toml`, fill in the REPLACE_* values,
-# then run `wrangler deploy` from this folder.
-
-name = "ghl-deal-ledger-worker"          # <-- must match the EXISTING worker name in Cloudflare
+name = "ghl-deal-ledger"
 main = "ghl-deal-ledger-worker.js"
 compatibility_date = "2024-01-01"
 
@@ -16,17 +9,15 @@ enabled = true
   invocation_logs = true
   head_sampling_rate = 1
 
-# Non-secret config (safe to keep in the file)
-[vars]
-SHEET_NAME = "Deal Ledger"
-SPREADSHEET_ID = "REPLACE_WITH_SPREADSHEET_ID"
-GOOGLE_CLIENT_EMAIL = "REPLACE_WITH_SERVICE_ACCOUNT_EMAIL"
-
-# KV namespace used to cache the Google access token (code binding: GHL_KV)
+# KV namespace used to cache the Google access token (code binding: GHL_KV).
+# Replace the id below with the REAL namespace id from Cloudflare:
+#   Dashboard -> Storage & Databases -> KV  (copy the ID next to the namespace)
+#   or: worker -> Settings -> Bindings -> the GHL_KV binding shows its namespace id
 [[kv_namespaces]]
 binding = "GHL_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "PASTE_REAL_KV_NAMESPACE_ID_HERE"
 
-# Secrets — do NOT put these in the file. Set them once via:
-#   wrangler secret put GOOGLE_PRIVATE_KEY
-#   wrangler secret put PANDADOC_WEBHOOK_SECRET
+# IMPORTANT: Do NOT add a [vars] block for SPREADSHEET_ID, GOOGLE_CLIENT_EMAIL,
+# SHEET_NAME, GOOGLE_PRIVATE_KEY, or PANDADOC_WEBHOOK_SECRET.
+# Those are already stored on the Worker as secrets. Declaring them here would
+# overwrite the real values on every deploy (which is what just broke the build).
