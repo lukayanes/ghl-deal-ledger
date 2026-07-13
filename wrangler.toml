@@ -1,0 +1,32 @@
+# wrangler.toml for the GHL Deal Ledger Worker
+# Optional — only needed if you want to deploy from the CLI (`wrangler deploy`)
+# instead of pasting into the Cloudflare dashboard.
+#
+# To use: rename this file to `wrangler.toml`, fill in the REPLACE_* values,
+# then run `wrangler deploy` from this folder.
+
+name = "ghl-deal-ledger-worker"          # <-- must match the EXISTING worker name in Cloudflare
+main = "ghl-deal-ledger-worker.js"
+compatibility_date = "2024-01-01"
+
+[observability]
+enabled = true
+
+  [observability.logs]
+  invocation_logs = true
+  head_sampling_rate = 1
+
+# Non-secret config (safe to keep in the file)
+[vars]
+SHEET_NAME = "Deal Ledger"
+SPREADSHEET_ID = "REPLACE_WITH_SPREADSHEET_ID"
+GOOGLE_CLIENT_EMAIL = "REPLACE_WITH_SERVICE_ACCOUNT_EMAIL"
+
+# KV namespace used to cache the Google access token (code binding: GHL_KV)
+[[kv_namespaces]]
+binding = "GHL_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Secrets — do NOT put these in the file. Set them once via:
+#   wrangler secret put GOOGLE_PRIVATE_KEY
+#   wrangler secret put PANDADOC_WEBHOOK_SECRET
