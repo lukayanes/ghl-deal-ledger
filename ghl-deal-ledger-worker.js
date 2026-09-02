@@ -244,46 +244,47 @@ function extractDeal(payload, knownType) {
     notes.push("Terms: " + clean(payload.additional_terms));
   }
 
+  // EMD is kept in notes for reference; the "Amount in Escrow" column is filled in manually.
   if (earnestMoney) notes.push("EMD: " + earnestMoney);
   if (existingMortgage) notes.push("Existing Mortgage: " + existingMortgage);
   if (balanceAtClosing) notes.push("Balance at Closing: " + balanceAtClosing);
 
-  let month = "";
-  if (underContractDate) month = formatMonthYear(underContractDate);
-
   return {
-    dealId: sellerName || "Unknown",
-    propertyAddress,
-    market: cleanMarket || state || "",
-    acqOwner: "Brennen",
-    dispositionOwner: "Aubrey",
-    dealStatus: "Under Contract",
-    strategy: dealType,
-    exitType: "Assignment",
-    underContractDate,
-    closeDateActualEst: closingDate,
-    month,
-    contractPrice,
-    listedPostedPrice: "",
-    buyerPriceSalePrice: "",
-    repairs: "",
-    potentialProfit: "",
-    buyerName: "",
-    listingAgentName: "",
-    finalProfit: "",
-    notes: notes.join(" | "),
+    dealId: sellerName || "Unknown",     // A: Deal ID
+    propertyAddress,                     // B: Property Address
+    market: cleanMarket || state || "",  // C: Market
+    dealStatus: "Under Contract",        // D: Deal Status
+    source: "",                          // E: Source — filled in manually
+    strategy: dealType,                  // F: Strategy
+    underContractDate,                   // G: Under Contract Date
+    closeDateActualEst: closingDate,     // H: Close Date (Actual/Est)
+    contractPrice,                       // I: Contract Price ($)
+    amountInEscrow: "",                  // J: Amount in Escrow ($) — filled in manually
+    finalProfit: "",                     // K: Final Profit ($) — filled in later by hand
+    notes: notes.join(" | "),            // L: Notes
   };
 }
 
 // ─── Row Builder ─────────────────────────────────────────────────────────────
 
+// Column order MUST match the sheet headers (A:L):
+// Deal ID | Property Address | Market | Deal Status | Source | Strategy |
+// Under Contract Date | Close Date (Actual/Est) | Contract Price ($) |
+// Amount in Escrow ($) | Final Profit ($) | Notes
 function dealToRow(deal) {
   return [
-    deal.dealId, deal.propertyAddress, deal.market, deal.acqOwner,
-    deal.dispositionOwner, deal.dealStatus, deal.strategy, deal.exitType,
-    deal.underContractDate, deal.closeDateActualEst, deal.month, deal.contractPrice,
-    deal.listedPostedPrice, deal.buyerPriceSalePrice, deal.repairs,
-    deal.potentialProfit, deal.buyerName, deal.listingAgentName, deal.finalProfit, deal.notes,
+    deal.dealId,             // A
+    deal.propertyAddress,    // B
+    deal.market,             // C
+    deal.dealStatus,         // D
+    deal.source,             // E
+    deal.strategy,           // F
+    deal.underContractDate,  // G
+    deal.closeDateActualEst, // H
+    deal.contractPrice,      // I
+    deal.amountInEscrow,     // J
+    deal.finalProfit,        // K
+    deal.notes,              // L
   ];
 }
 
@@ -299,7 +300,11 @@ async function writeToLedger(env, deal) {
     "Content-Type": "application/json",
   };
 
-  // Step 1: Insert a blank row at row 4 (0-indexed row 3) to push data down
+  // First data row (1-based). New deals are inserted here so the newest sits on top.
+  // Override with the FIRST_DATA_ROW env var if your header rows change; defaults to 4.
+  const dataRow = parseInt(env.FIRST_DATA_ROW, 10) || 4;
+
+  // Step 1: Insert a blank row at the top of the data area to push existing rows down
   const insertRes = await fetch(baseUrl + ":batchUpdate", {
     method: "POST",
     headers,
@@ -309,8 +314,8 @@ async function writeToLedger(env, deal) {
           range: {
             sheetId: 0,
             dimension: "ROWS",
-            startIndex: 3,
-            endIndex: 4,
+            startIndex: dataRow - 1,
+            endIndex: dataRow,
           },
           inheritFromBefore: false,
         },
@@ -323,10 +328,11 @@ async function writeToLedger(env, deal) {
     throw new Error("Sheets insertDimension failed (" + insertRes.status + "): " + text);
   }
 
-  // Step 2: Write the deal data into row 4 (A:T = 20 columns)
+  // Step 2: Write the deal data into the new row (A:L = 12 columns)
   const rowValues = dealToRow(deal);
+  const range = "'" + sheetName + "'!A" + dataRow + ":L" + dataRow;
   const updateRes = await fetch(
-    baseUrl + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:T4") + "?valueInputOption=USER_ENTERED",
+    baseUrl + "/values/" + encodeURIComponent(range) + "?valueInputOption=USER_ENTERED",
     {
       method: "PUT",
       headers,
