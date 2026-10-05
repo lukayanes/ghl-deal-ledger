@@ -254,21 +254,22 @@ function extractDeal(payload, knownType) {
     propertyAddress,                     // B: Property Address
     market: cleanMarket || state || "",  // C: Market
     dealStatus: "Under Contract",        // D: Deal Status
-    source: "",                          // E: Source — filled in manually
-    strategy: dealType,                  // F: Strategy
-    underContractDate,                   // G: Under Contract Date
-    closeDateActualEst: closingDate,     // H: Close Date (Actual/Est)
-    contractPrice,                       // I: Contract Price ($)
-    amountInEscrow: "",                  // J: Amount in Escrow ($) — filled in manually
-    finalProfit: "",                     // K: Final Profit ($) — filled in later by hand
-    notes: notes.join(" | "),            // L: Notes
+    reasonLost: "",                      // E: Reason Lost — filled in manually when a deal is lost
+    source: "",                          // F: Source — filled in manually
+    strategy: dealType,                  // G: Strategy
+    underContractDate,                   // H: Under Contract Date
+    closeDateActualEst: closingDate,     // I: Close Date (Actual/Est)
+    contractPrice,                       // J: Contract Price ($)
+    amountInEscrow: "",                  // K: Amount in Escrow ($) — filled in manually
+    finalProfit: "",                     // L: Final Profit ($) — filled in later by hand
+    notes: notes.join(" | "),            // M: Notes
   };
 }
 
 // ─── Row Builder ─────────────────────────────────────────────────────────────
 
-// Column order MUST match the sheet headers (A:L):
-// Deal ID | Property Address | Market | Deal Status | Source | Strategy |
+// Column order MUST match the sheet headers (A:M):
+// Deal ID | Property Address | Market | Deal Status | Reason Lost | Source | Strategy |
 // Under Contract Date | Close Date (Actual/Est) | Contract Price ($) |
 // Amount in Escrow ($) | Final Profit ($) | Notes
 function dealToRow(deal) {
@@ -277,14 +278,15 @@ function dealToRow(deal) {
     deal.propertyAddress,    // B
     deal.market,             // C
     deal.dealStatus,         // D
-    deal.source,             // E
-    deal.strategy,           // F
-    deal.underContractDate,  // G
-    deal.closeDateActualEst, // H
-    deal.contractPrice,      // I
-    deal.amountInEscrow,     // J
-    deal.finalProfit,        // K
-    deal.notes,              // L
+    deal.reasonLost,         // E
+    deal.source,             // F
+    deal.strategy,           // G
+    deal.underContractDate,  // H
+    deal.closeDateActualEst, // I
+    deal.contractPrice,      // J
+    deal.amountInEscrow,     // K
+    deal.finalProfit,        // L
+    deal.notes,              // M
   ];
 }
 
@@ -328,9 +330,9 @@ async function writeToLedger(env, deal) {
     throw new Error("Sheets insertDimension failed (" + insertRes.status + "): " + text);
   }
 
-  // Step 2: Write the deal data into the new row (A:L = 12 columns)
+  // Step 2: Write the deal data into the new row (A:M = 13 columns)
   const rowValues = dealToRow(deal);
-  const range = "'" + sheetName + "'!A" + dataRow + ":L" + dataRow;
+  const range = "'" + sheetName + "'!A" + dataRow + ":M" + dataRow;
   const updateRes = await fetch(
     baseUrl + "/values/" + encodeURIComponent(range) + "?valueInputOption=USER_ENTERED",
     {
