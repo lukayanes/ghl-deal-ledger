@@ -1,19 +1,22 @@
 /**
- * GHL Deal Ledger Worker — Google Sheets Edition (v2: PandaDoc support)
+ * Leo Deal Ledger Worker — Google Sheets Edition
  *
- * Endpoints:
- *   POST /webhook            — Original GHL native contract webhook
- *   POST /pandadoc-webhook   — NEW: PandaDoc signed-document webhook
- *   POST /test               — Test payload parsing without writing
- *   GET  /health             — Health check
+ * Receives Leo's outgoing webhook when a deal goes under contract and inserts a
+ * new row at row 4 (top of data) of the Summit Group Deal Ledger on Google Sheets.
+ * Leo's webhook body = { event, delivered_at, lead, contact, phones, stage, board, owners, money, ... }
+ * (the same body as GET /v1/leads/:id). Deals already in the ledger (matched on the Leo
+ * deal id written into Notes, or on seller name + street) are skipped.
  *
- * Required env vars:
- *   GOOGLE_CLIENT_EMAIL       — service account email
- *   GOOGLE_PRIVATE_KEY        — PEM private key (RS256)
- *   SPREADSHEET_ID            — Google Sheets spreadsheet ID
- *   SHEET_NAME                — worksheet tab name (default: "Deal Ledger")
- *   PANDADOC_WEBHOOK_SECRET   — NEW: shared secret from PandaDoc webhook subscription
- *   GHL_KV                    — KV namespace binding for Google access token cache
+ * ZERO external dependencies — deploys as a single file.
+ *
+ * Required env vars (unchanged from the GHL version):
+ *   GOOGLE_CLIENT_EMAIL  — service account email
+ *   GOOGLE_PRIVATE_KEY   — PEM private key (RS256)
+ *   SPREADSHEET_ID       — Google Sheets spreadsheet ID
+ *   SHEET_NAME           — worksheet tab name (default: "Deal Ledger")
+ *   GHL_KV               — KV binding used to cache the Google token (name kept so no rebinding is needed)
+ * Optional:
+ *   LEO_WEBHOOK_SECRET   — if set, requests must carry it as ?secret=... or X-Webhook-Secret header
  */
 
 // ─── Google Service Account Auth (JWT → Access Token) ───────────────────────
@@ -81,39 +84,6 @@ async function getGoogleAccessToken(env) {
   return data.access_token;
 }
 
-// ─── Deal Type Detection ────────────────────────────────────────────────────
-
-function detectDealType(payload) {
-  // Normalize: lowercase + strip all non-alphanumerics, so "Sub-To", "sub_to",
-  // "subto", "Subject To", "Sub 2" all collapse to a comparable string.
-  function n(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
-  function isSubTo(s) { const x = n(s); return x.includes("subto") || x.includes("subjectto") || x.includes("sub2"); }
-  function isSellerFin(s) { const x = n(s); return x.includes("sellerfinance") || x.includes("sellerfinancing") || x.includes("ownerfinance") || x.includes("carryback"); }
-
-  const explicit = n(payload.deal_type || payload.dealType);
-  if (explicit.includes("novation")) return "Novation";
-  if (isSubTo(explicit)) return "Subject-to";
-  if (isSellerFin(explicit)) return "Seller Finance";
-  if (explicit.includes("cash")) return "Cash";
-
-  // Check document name AND template name. Per-deal documents are often renamed
-  // (e.g. "Agreement_Evans"), but the underlying template keeps the type keyword.
-  const both = n(payload.document_name || payload.workflow_name || payload.name) + "|" + n(payload.template_name);
-  if (both.includes("novation")) return "Novation";
-  if (isSubTo(both)) return "Subject-to";
-  if (isSellerFin(both)) return "Seller Finance";
-  if (both.includes("cash")) return "Cash";
-  if (both.includes("amendment")) return "Amendment";
-  if (both.includes("assignment")) return "Assignment";
-
-  if (payload.purchase_price_novation || payload.closing_date_novation || payload.emd_novation) return "Novation";
-  if (payload.purchase_price_cash || payload.closing_date_cash || payload.county_cash) return "Cash";
-  if (payload.seller_finance_terms) return "Seller Finance";
-  if (payload.existing_mortgage_balance || payload.monthly_mortgage_payment) return "Subject-to";
-
-  return "Unknown";
-}
-
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function clean(val) {
@@ -160,110 +130,112 @@ function formatMonthYear(val) {
   return mm + "-" + yy;
 }
 
-// ─── Extract Deal from Webhook Payload ──────────────────────────────────────
+// ─── Extract Deal from a Leo webhook body ───────────────────────────────────
 
-function extractDeal(payload, knownType) {
-  const dealType = knownType || detectDealType(payload);
+const OWNER_FIRST = { aubrey: "Aubrey", luka: "Luka", brennen: "Brennen" };
+function ownerName(o, fallback) {
+  const full = clean(o && o.name);
+  if (!full) return fallback;
+  const first = full.split(/\s+/)[0];
+  return OWNER_FIRST[first.toLowerCase()] || first;
+}
 
-  const firstName = clean(payload.first_name) || clean(payload.firstName) || clean(payload.contact_first_name);
-  const lastName = clean(payload.last_name) || clean(payload.lastName) || clean(payload.contact_last_name);
-  const sellerName = (firstName + " " + lastName).trim();
+function strategyFromLeo(lead) {
+  const t = clean(lead.offer_type).toLowerCase();
+  if (t.includes("novation")) return "Novation";
+  if (t.includes("cash")) return "Cash";
+  if (t.includes("sub") && t.includes("to")) return "Subject-to";
+  if (t.includes("seller") && t.includes("finance")) return "Seller Finance";
+  if (t.includes("list")) return "Listing Agent";
+  if (t.includes("creative")) return "Creative";
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : "Unknown";
+}
 
-  const fullAddress = clean(payload.full_address_1);
-  const street = clean(payload.address1) || clean(payload.street_address);
-  const city = clean(payload.city);
-  const state = clean(payload.state);
-  const zip = clean(payload.postal_code) || clean(payload.zip);
-  const propertyAddress = fullAddress || [street, city, state, zip].filter(Boolean).join(", ");
+function extractLeoDeal(body) {
+  const lead = body.lead || {};
+  const contact = body.contact || {};
+  const owners = body.owners || {};
+  const money = body.money || {};
 
-  let cleanMarket = state || "";
-  if (!cleanMarket && fullAddress) {
-    const parts = fullAddress.split(",").map(function(s) { return s.trim(); });
-    if (parts.length >= 3) {
-      const stateZip = parts[parts.length - 1];
-      const stateMatch = stateZip.match(/^([A-Za-z\s]+)/);
-      if (stateMatch) cleanMarket = stateMatch[1].trim();
-    }
+  const sellerName = clean(contact.full_name) || [clean(contact.first_name), clean(contact.last_name)].filter(Boolean).join(" ") || "Unknown";
+  const propertyAddress = [clean(lead.property_line1), clean(lead.property_city), clean(lead.property_state), clean(lead.property_zip)].filter(Boolean).join(", ");
+  const strategy = strategyFromLeo(lead);
+
+  const underContractDate = formatDate(lead.contract_date || body.delivered_at || new Date().toISOString());
+  const closingDate = lead.closing_date ? formatDate(lead.closing_date) : "";
+
+  // Columns that no longer exist on the simplified sheet (acq/dispo owner, list/buyer
+  // price, rehab, projected fee, etc.) are preserved in Notes instead of being dropped.
+  const notes = ["Auto-added from Leo webhook.", "Leo:" + clean(lead.id)];
+  if (clean(lead.offer_type)) notes.push("Deal type: " + clean(lead.offer_type) + (lead.is_double_close ? " (double close)" : "") + (lead.is_flat_fee ? " (flat fee)" : ""));
+  const projFee = formatMoney(lead.assignment_fee || lead.projected_fee || lead.target_fee || money.projected_profit);
+  if (projFee) notes.push("Projected fee: " + projFee);
+  if (clean(money.emd_amount)) notes.push("EMD: " + formatMoney(money.emd_amount));
+  if (clean(lead.inspection_period_end)) notes.push("Inspection ends: " + formatDate(lead.inspection_period_end));
+  if (clean(lead.emd_due)) notes.push("EMD due: " + formatDate(lead.emd_due));
+  if (clean(lead.payoff_amount)) notes.push("Payoff: " + formatMoney(lead.payoff_amount));
+  if (clean(lead.arv)) notes.push("ARV: " + formatMoney(lead.arv));
+  if (clean(lead.rehab_costs)) notes.push("Rehab: " + formatMoney(lead.rehab_costs));
+  if (clean(lead.list_price)) notes.push("List price: " + formatMoney(lead.list_price));
+  const acq = ownerName(owners.acquisitions, "");
+  const dispo = ownerName(owners.dispositions, "");
+  if (acq) notes.push("Acq: " + acq);
+  if (dispo) notes.push("Dispo: " + dispo);
+  if (body.stage && body.stage.name) notes.push("Leo stage: " + body.stage.name);
+
+  // Source: prefer a "Source: ..." tag (the marketing channel), else Leo's record source.
+  let dealSource = "";
+  if (Array.isArray(body.tags)) {
+    const st = body.tags.find(function (t) { return /^\s*source\s*:/i.test(String(t)); });
+    if (st) dealSource = String(st).replace(/^\s*source\s*:\s*/i, "").trim();
   }
-
-  let contractPrice = "";
-  let closingDate = "";
-  let underContractDate = "";
-  let earnestMoney = "";
-  let existingMortgage = "";
-  let balanceAtClosing = "";
-  let notes = ["Auto-added from " + (payload._source || "GHL") + " webhook."];
-
-  if (dealType === "Novation") {
-    contractPrice = formatMoney(payload.purchase_price_novation);
-    closingDate = formatDate(payload.closing_date_novation);
-    underContractDate = formatDate(payload.date_completed_by_novation);
-    earnestMoney = clean(payload.emd_novation);
-    if (clean(payload.additional_terms)) notes.push("Terms: " + clean(payload.additional_terms));
-  } else if (dealType === "Cash") {
-    contractPrice = formatMoney(payload.purchase_price_cash);
-    closingDate = formatDate(payload.closing_date_cash);
-    underContractDate = formatDate(payload.date_completed_by_cash);
-    balanceAtClosing = clean(payload.amt_due_at_closing_cash);
-    if (clean(payload.emd_cash) || clean(payload.emd)) earnestMoney = clean(payload.emd_cash) || clean(payload.emd);
-    if (clean(payload.due_diligence_cash)) notes.push("Due Diligence: " + clean(payload.due_diligence_cash) + " days");
-  } else if (dealType === "Subject-to") {
-    contractPrice = formatMoney(payload.total_purchase_price);
-    closingDate = formatDate(payload.closing_date);
-    underContractDate = formatDate(payload.date_and_time_completed_by);
-    existingMortgage = formatMoney(payload.existing_mortgage_balance);
-    if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
-    if (clean(payload.years_remaining_on_mortgage)) notes.push("Years Remaining: " + clean(payload.years_remaining_on_mortgage));
-    if (clean(payload.months_remaining_on_mortgage)) notes.push("Months Remaining: " + clean(payload.months_remaining_on_mortgage));
-    if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
-  } else if (dealType === "Seller Finance") {
-    contractPrice = formatMoney(payload.total_purchase_price);
-    closingDate = formatDate(payload.closing_date);
-    underContractDate = formatDate(payload.date_and_time_completed_by);
-    existingMortgage = formatMoney(payload.existing_mortgage_balance);
-    if (clean(payload.seller_finance_terms)) notes.push("SF Terms: " + clean(payload.seller_finance_terms));
-    if (clean(payload.monthly_mortgage_payment)) notes.push("Monthly Payment: " + formatMoney(payload.monthly_mortgage_payment));
-    if (clean(payload.down_payment)) notes.push("Down Payment: " + formatMoney(payload.down_payment));
-    if (clean(payload.deposit)) earnestMoney = formatMoney(payload.deposit);
-  }
-
-  if (clean(payload.amendment_purchase_price)) {
-    contractPrice = formatMoney(payload.amendment_purchase_price);
-    notes.push("Amendment applied");
-  }
-  if (clean(payload.amendment_closing_date)) {
-    closingDate = formatDate(payload.amendment_closing_date);
-  }
-  if (clean(payload.amendment__other_notes)) {
-    notes.push("Amendment Notes: " + clean(payload.amendment__other_notes));
-  }
-
-  // Add additional_terms to notes universally (not just Novation) — for PandaDoc flow
-  const alreadyHasTerms = notes.some(function(n) { return typeof n === "string" && n.indexOf("Terms:") === 0; });
-  if (clean(payload.additional_terms) && !alreadyHasTerms) {
-    notes.push("Terms: " + clean(payload.additional_terms));
-  }
-
-  // EMD is kept in notes for reference; the "Amount in Escrow" column is filled in manually.
-  if (earnestMoney) notes.push("EMD: " + earnestMoney);
-  if (existingMortgage) notes.push("Existing Mortgage: " + existingMortgage);
-  if (balanceAtClosing) notes.push("Balance at Closing: " + balanceAtClosing);
+  if (!dealSource) dealSource = clean(lead.source);
 
   return {
-    dealId: sellerName || "Unknown",     // A: Deal ID
+    leoId: clean(lead.id),               // kept for duplicate detection (also written into Notes)
+    dealId: sellerName,                  // A: Deal ID
     propertyAddress,                     // B: Property Address
-    market: cleanMarket || state || "",  // C: Market
+    market: clean(lead.property_state),  // C: Market
     dealStatus: "Under Contract",        // D: Deal Status
     reasonLost: "",                      // E: Reason Lost — filled in manually when a deal is lost
-    source: "",                          // F: Source — filled in manually
-    strategy: dealType,                  // G: Strategy
+    source: dealSource,                  // F: Source — auto-filled from Leo (tag or record source)
+    strategy,                            // G: Strategy
     underContractDate,                   // H: Under Contract Date
     closeDateActualEst: closingDate,     // I: Close Date (Actual/Est)
-    contractPrice,                       // J: Contract Price ($)
+    contractPrice: formatMoney(lead.contract_price), // J: Contract Price ($)
     amountInEscrow: "",                  // K: Amount in Escrow ($) — filled in manually
-    finalProfit: "",                     // L: Final Profit ($) — filled in later by hand
+    finalProfit: "",                     // L: Final Profit ($) — filled in manually
     notes: notes.join(" | "),            // M: Notes
   };
+}
+
+// Is this webhook a deal going under contract? (Leo's transaction board, or the Active board's pre-dispo UC stage)
+function isUnderContractEvent(body) {
+  const boardKind = clean(body.board && body.board.kind).toLowerCase();
+  const stageSlug = clean(body.stage && body.stage.slug).toLowerCase();
+  const stageName = clean(body.stage && body.stage.name).toLowerCase();
+  if (boardKind === "transaction") return true;
+  if (stageSlug.includes("under_contract") || stageName.includes("under contract")) return true;
+  return false;
+}
+
+// ─── Duplicate check against the sheet (Leo id in Notes, or seller + street) ─
+
+async function alreadyInLedger(env, deal) {
+  const token = await getGoogleAccessToken(env);
+  const sheetName = env.SHEET_NAME || "Deal Ledger";
+  const res = await fetch("https://sheets.googleapis.com/v4/spreadsheets/" + env.SPREADSHEET_ID + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:M"), { headers: { Authorization: "Bearer " + token } });
+  if (!res.ok) return false;   // if we cannot read, do not block the insert
+  const rows = (await res.json()).values || [];
+  const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const street = norm((deal.propertyAddress || "").split(",")[0]);
+  const name = norm(deal.dealId);
+  for (const r of rows) {
+    const notes = String(r[12] || "");   // Notes is column M (index 12)
+    if (deal.leoId && notes.includes("Leo:" + deal.leoId)) return "leo id";
+    if (name && norm(r[0]) === name && street && norm(r[1]).startsWith(street)) return "name + street";
+  }
+  return false;
 }
 
 // ─── Row Builder ─────────────────────────────────────────────────────────────
@@ -302,8 +274,8 @@ async function writeToLedger(env, deal) {
     "Content-Type": "application/json",
   };
 
-  // First data row (1-based). New deals are inserted here so the newest sits on top.
-  // Override with the FIRST_DATA_ROW env var if your header rows change; defaults to 4.
+  // First data row (1-based). New deals insert here so the newest sits on top.
+  // Override with the FIRST_DATA_ROW env var if the header rows change; defaults to 4.
   const dataRow = parseInt(env.FIRST_DATA_ROW, 10) || 4;
 
   // Step 1: Insert a blank row at the top of the data area to push existing rows down
@@ -332,9 +304,8 @@ async function writeToLedger(env, deal) {
 
   // Step 2: Write the deal data into the new row (A:M = 13 columns)
   const rowValues = dealToRow(deal);
-  const range = "'" + sheetName + "'!A" + dataRow + ":M" + dataRow;
   const updateRes = await fetch(
-    baseUrl + "/values/" + encodeURIComponent(range) + "?valueInputOption=USER_ENTERED",
+    baseUrl + "/values/" + encodeURIComponent("'" + sheetName + "'!A" + dataRow + ":M" + dataRow) + "?valueInputOption=USER_ENTERED",
     {
       method: "PUT",
       headers,
@@ -351,389 +322,46 @@ async function writeToLedger(env, deal) {
   return { success: true, deal: deal.dealId, address: deal.propertyAddress, strategy: deal.strategy };
 }
 
-// ─── Flatten nested GHL payload ─────────────────────────────────────────────
-
-function flattenPayload(raw) {
-  const flat = {};
-
-  function merge(obj) {
-    if (!obj || typeof obj !== "object") return;
-    for (const [key, val] of Object.entries(obj)) {
-      if (val && typeof val === "object" && !Array.isArray(val) && key !== "customData") {
-        merge(val);
-      } else {
-        flat[key] = val;
-      }
-    }
-  }
-
-  merge(raw);
-
-  if (Array.isArray(raw.customData)) {
-    for (const item of raw.customData) {
-      if (item.field_key && item.value !== undefined) flat[item.field_key] = item.value;
-    }
-  }
-  if (raw.contact && Array.isArray(raw.contact.customData)) {
-    for (const item of raw.contact.customData) {
-      if (item.field_key && item.value !== undefined) flat[item.field_key] = item.value;
-    }
-  }
-
-  return flat;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// NEW: PandaDoc Webhook Handler
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Verify PandaDoc HMAC signature
-async function verifyPandaDocSignature(signatureHeader, body, secret) {
-  if (!signatureHeader || !secret) return false;
-
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw", enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
-  const sigHex = Array.from(new Uint8Array(sig))
-    .map(function(b) { return b.toString(16).padStart(2, "0"); })
-    .join("");
-
-  // Allow signature header to be raw hex OR "sha256=hex" prefixed
-  const provided = signatureHeader.replace(/^sha256=/i, "").trim();
-  return provided === sigHex;
-}
-
-// Convert PandaDoc tokens array → flat object keyed by token name.
-// Handles BOTH formats PandaDoc has used:
-//   - {"name": "x", "value": "y"}  (legacy / API v1)
-//   - {"x": "y"}                    (current webhook format — key IS the token name)
-function pandaDocTokensToMap(tokens) {
-  const map = {};
-  if (!Array.isArray(tokens)) return map;
-  for (const t of tokens) {
-    if (!t || typeof t !== "object") continue;
-    // Legacy format
-    if (t.name !== undefined) {
-      map[t.name] = t.value;
-      continue;
-    }
-    // Current format — each object has one key/value pair (the token name/value)
-    for (const [k, v] of Object.entries(t)) {
-      map[k] = v;
-    }
-  }
-  return map;
-}
-
-// Find the primary seller recipient.
-// Checks BOTH `role` (string) AND `roles` (array) since PandaDoc uses both.
-function findSellerRecipient(recipients) {
-  if (!Array.isArray(recipients) || recipients.length === 0) return {};
-
-  // Try roles array first (current PandaDoc format)
-  const byRolesArray = recipients.find(function(r) {
-    if (!r || !Array.isArray(r.roles)) return false;
-    return r.roles.some(function(role) { return /seller/i.test(role); });
-  });
-  if (byRolesArray) return byRolesArray;
-
-  // Try role string (legacy)
-  const byRoleString = recipients.find(function(r) {
-    return r && typeof r.role === "string" && /seller\s*1|seller$/i.test(r.role);
-  });
-  if (byRoleString) return byRoleString;
-
-  // Otherwise first signer
-  const signer = recipients.find(function(r) { return r && r.recipient_type === "signer"; });
-  return signer || recipients[0] || {};
-}
-
-// Helper: get a token value by name. Tries an exact match first, then a
-// normalized match (case-, space-, underscore-, and punctuation-insensitive)
-// so "Purchase Price", "purchase_price", and "purchaseprice" all resolve.
-function getToken(tokens, ...candidates) {
-  for (const name of candidates) {
-    if (tokens[name] !== undefined && tokens[name] !== null && tokens[name] !== "") return tokens[name];
-  }
-  const norm = function (s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); };
-  const normMap = {};
-  for (const [k, v] of Object.entries(tokens)) {
-    const nk = norm(k);
-    if (normMap[nk] === undefined || normMap[nk] === null || normMap[nk] === "") normMap[nk] = v;
-  }
-  for (const name of candidates) {
-    const v = normMap[norm(name)];
-    if (v !== undefined && v !== null && v !== "") return v;
-  }
-  return "";
-}
-
-// Combine "add 1" + "add 2" style additional-terms tokens into one string
-function combineAdditionalTerms(tokens) {
-  const parts = [];
-  for (let i = 1; i <= 10; i++) {
-    const v = tokens["add " + i] || tokens["add_" + i] || tokens["additional_term_" + i] || "";
-    if (v) parts.push(v);
-  }
-  if (tokens.additional_terms) parts.push(tokens.additional_terms);
-  return parts.join(" | ");
-}
-
-// Reshape PandaDoc data into the GHL-style payload that extractDeal() expects
-function pandaDocToGHLShape(pdData) {
-  const tokens = pandaDocTokensToMap(pdData.tokens || pdData.fields);
-  const seller = findSellerRecipient(pdData.recipients);
-
-  // Seller info — prefer tokens ([Seller.FirstName] etc.) since they're always present,
-  // fall back to recipient data.
-  const firstName = getToken(tokens, "Seller.FirstName", "seller first name", "first name", "firstname") || seller.first_name || "";
-  const lastName = getToken(tokens, "Seller.LastName", "seller last name", "last name", "lastname") || seller.last_name || "";
-
-  // Address — Summit uses [Seller.StreetAddress] for both seller address AND property address
-  // (typical when seller lives at the property). Token comes as full string like
-  // "12217 S Summit St, Olathe, Kansas 66062" — let extractDeal() parse it.
-  const fullSellerAddress = getToken(tokens, "Seller.StreetAddress", "seller street address", "property address", "street address", "address")
-                          || seller.street_address
-                          || seller.address
-                          || "";
-
-  const shape = {
-    _source: "PandaDoc",
-    document_name: pdData.name || "",
-    template_name: (pdData.template && pdData.template.name) || "",
-    first_name: firstName,
-    last_name: lastName,
-    email: seller.email || "",
-    phone: seller.phone || "",
-    full_address_1: fullSellerAddress,
-  };
-
-  // Detect deal type from BOTH document name and template name.
-  // Document name may be customized per-deal (e.g. "Partnership Agreement_Evans"),
-  // but the template name keeps the type keyword.
-  let dealType = detectDealType({ document_name: pdData.name });
-  if (dealType === "Unknown" && pdData.template && pdData.template.name) {
-    dealType = detectDealType({ document_name: pdData.template.name });
-  }
-
-  // Combined additional terms ("add 1" + "add 2" → single string)
-  const additionalTerms = combineAdditionalTerms(tokens);
-
-  // Helper aliases for common tokens (handles variation across Summit's templates)
-  const pp = function() { return getToken(tokens, "pp", "purchase price", "purchase_price", "total purchase price", "total price", "contract price", "sales price", "sale price", "price"); };
-  const closing = function() { return getToken(tokens, "closing date", "closing_date", "close date", "estimated closing date"); };
-  const dateExp = function() { return getToken(tokens, "date ex", "date exp", "date_exp", "acceptance_date") || pdData.date_completed || ""; };
-  const timeExp = function() { return getToken(tokens, "time ex", "time exp", "time_exp", "acceptance_time"); };
-  const emd = function() { return getToken(tokens, "emd", "emd_amount", "deposit"); };
-  const balanceDue = function() { return getToken(tokens, "balance due at closing", "balance_due_at_closing"); };
-  const dueDil = function() { return getToken(tokens, "due dil", "due diligence days", "due_diligence_days", "due diligence"); };
-  const county = function() { return getToken(tokens, "county"); };
-  const titleSurvey = function() { return getToken(tokens, "title and survey", "title_and_survey"); };
-
-  // Sub-To / Seller Finance specific
-  const existingMortgage = function() { return getToken(tokens, "existing mortgage", "existing mortgage balance", "existing_mortgage_balance"); };
-  const piti = function() { return getToken(tokens, "PITI", "monthly mortgage payment", "monthly_mortgage_payment"); };
-  const yrsLeft = function() { return getToken(tokens, "Yrs", "yrs", "years_remaining_on_mortgage"); };
-  const mosLeft = function() { return getToken(tokens, "mo's", "mos", "months_remaining_on_mortgage"); };
-  const sfTerms = function() { return getToken(tokens, "seller financing terms", "seller finance terms", "seller_finance_terms"); };
-  const sfAmount = function() { return getToken(tokens, "seller financing", "seller_financing"); };
-  const downPayment = function() { return getToken(tokens, "down payment", "down_payment"); };
-
-  // Surface county and title/survey in notes if present (since the deal ledger doesn't have those columns)
-  let extraNotes = additionalTerms;
-  if (county()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "County: " + county();
-  if (titleSurvey()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "Title/Survey: " + titleSurvey() + " days";
-  if (dueDil()) extraNotes = (extraNotes ? extraNotes + " | " : "") + "Due Diligence: " + dueDil() + " days";
-
-  // Map deal-type-specific tokens
-  if (dealType === "Novation") {
-    shape.purchase_price_novation = pp();
-    shape.closing_date_novation = closing();
-    shape.date_completed_by_novation = dateExp();
-    shape.time_completed_by_novation = timeExp();
-    shape.emd_novation = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Cash") {
-    shape.purchase_price_cash = pp();
-    shape.closing_date_cash = closing();
-    shape.date_completed_by_cash = dateExp();
-    shape.amt_due_at_closing_cash = balanceDue();
-    shape.due_diligence_cash = dueDil();
-    shape.emd_cash = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Subject-to") {
-    shape.total_purchase_price = pp();
-    shape.closing_date = closing();
-    shape.date_and_time_completed_by = dateExp();
-    shape.existing_mortgage_balance = existingMortgage();
-    shape.monthly_mortgage_payment = piti();
-    shape.years_remaining_on_mortgage = yrsLeft();
-    shape.months_remaining_on_mortgage = mosLeft();
-    shape.deposit = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Seller Finance") {
-    shape.total_purchase_price = pp();
-    shape.closing_date = closing();
-    shape.date_and_time_completed_by = dateExp();
-    shape.seller_finance_terms = sfTerms() || sfAmount() || extraNotes;
-    shape.down_payment = downPayment();
-    shape.monthly_mortgage_payment = piti();
-    shape.existing_mortgage_balance = existingMortgage();
-    shape.deposit = emd();
-    shape.additional_terms = extraNotes;
-  } else if (dealType === "Amendment") {
-    shape.amendment_purchase_price = pp();
-    shape.amendment_closing_date = closing();
-    shape.amendment__other_notes = getToken(tokens, "other", "additional_terms") || extraNotes;
-  }
-
-  return { shape, dealType };
-}
-
-async function handlePandaDocWebhook(request, env) {
-  const body = await request.text();
-
-  // PandaDoc sends signature as a query parameter: /pandadoc-webhook?signature=<hex>
-  // Fall back to header-based for flexibility.
-  const url = new URL(request.url);
-  const signature = url.searchParams.get("signature")
-                 || request.headers.get("x-pandadoc-signature")
-                 || request.headers.get("X-PandaDoc-Signature")
-                 || request.headers.get("signature");
-
-  const sigValid = await verifyPandaDocSignature(signature, body, env.PANDADOC_WEBHOOK_SECRET);
-  if (!sigValid) {
-    console.warn("PandaDoc webhook signature invalid. Received: " + (signature || "(none)").slice(0, 16) + "... Body len: " + body.length);
-    return new Response(JSON.stringify({ error: "Invalid signature" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // PandaDoc sends an array of events
-  let events;
-  try {
-    const parsed = JSON.parse(body);
-    events = Array.isArray(parsed) ? parsed : [parsed];
-  } catch (err) {
-    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  const results = [];
-  for (const ev of events) {
-    try {
-      const eventType = ev.event || ev.event_type || "";
-      const data = ev.data || ev;
-      const status = (data.status || "").toLowerCase();
-
-      // Only act on signed/completed documents
-      const isCompleted = status === "document.completed"
-                       || status === "completed"
-                       || eventType === "document_state_changed" && status === "document.completed";
-
-      if (!isCompleted) {
-        results.push({ skipped: true, reason: "Not a completion event", event: eventType, status });
-        continue;
-      }
-
-      const { shape, dealType } = pandaDocToGHLShape(data);
-
-      // Amendment / Assignment: skip writing a new row (they modify existing deals)
-      if (dealType === "Amendment" || dealType === "Assignment") {
-        results.push({ skipped: true, reason: dealType + " — update logic not yet implemented", documentName: data.name });
-        continue;
-      }
-
-      if (dealType === "Unknown") {
-        results.push({ skipped: true, reason: "Unknown deal type from document name", documentName: data.name });
-        continue;
-      }
-
-      const deal = extractDeal(shape, dealType);
-      console.log("PandaDoc deal: " + deal.dealId + " | " + deal.strategy + " | " + deal.contractPrice);
-
-      const result = await writeToLedger(env, deal);
-      results.push(result);
-    } catch (err) {
-      console.error("PandaDoc event error: " + err.message);
-      results.push({ error: err.message });
-    }
-  }
-
-  return new Response(JSON.stringify({ results }), {
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// END NEW PandaDoc handler
-// ═══════════════════════════════════════════════════════════════════════════
-
 // ─── Worker Entry Points ─────────────────────────────────────────────────────
+
+function json(obj, status) {
+  return new Response(JSON.stringify(obj, null, 2), { status: status || 200, headers: { "Content-Type": "application/json" } });
+}
+
+function authorized(request, url, env) {
+  if (!env.LEO_WEBHOOK_SECRET) return true;
+  return url.searchParams.get("secret") === env.LEO_WEBHOOK_SECRET || request.headers.get("X-Webhook-Secret") === env.LEO_WEBHOOK_SECRET;
+}
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok", time: new Date().toISOString() }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    if (url.pathname === "/health") return json({ status: "ok", crm: "leo", time: new Date().toISOString() });
 
-    // ── Existing GHL native contract webhook ──
-    if (url.pathname === "/webhook" && request.method === "POST") {
+    if ((url.pathname === "/webhook" || url.pathname === "/test") && request.method === "POST") {
+      if (!authorized(request, url, env)) return json({ error: "unauthorized" }, 401);
       try {
-        const rawPayload = await request.json();
-        console.log("GHL Webhook received: " + Object.keys(rawPayload).join(", "));
+        const body = await request.json();
+        if (!body || !body.lead) return json({ error: "Expected a Leo webhook body with a lead object", keys: Object.keys(body || {}) }, 400);
+        const deal = extractLeoDeal(body);
+        const underContract = isUnderContractEvent(body);
+        const force = url.searchParams.get("force") === "1";
 
-        const payload = flattenPayload(rawPayload);
-        const deal = extractDeal(payload);
-        console.log("Deal: " + deal.dealId + " | " + deal.strategy + " | " + deal.contractPrice);
+        if (url.pathname === "/test") return json({ event: body.event, underContract, deal, row: dealToRow(deal) });
+
+        if (!underContract && !force) return json({ skipped: true, reason: "not an under-contract stage", event: body.event, stage: body.stage && body.stage.name, board: body.board && body.board.kind });
+        const dup = await alreadyInLedger(env, deal);
+        if (dup && !force) return json({ skipped: true, reason: "already in ledger (" + dup + ")", deal: deal.dealId });
 
         const result = await writeToLedger(env, deal);
-
-        return new Response(JSON.stringify(result), {
-          headers: { "Content-Type": "application/json" },
-        });
+        return json(Object.assign({ event: body.event }, result));
       } catch (err) {
         console.error("Webhook error: " + err.message);
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
+        return json({ error: err.message }, 500);
       }
     }
 
-    // ── NEW: PandaDoc webhook ──
-    if (url.pathname === "/pandadoc-webhook" && request.method === "POST") {
-      return await handlePandaDocWebhook(request, env);
-    }
-
-    // ── Test endpoint (no write) ──
-    if (url.pathname === "/test" && request.method === "POST") {
-      try {
-        const rawPayload = await request.json();
-        const payload = flattenPayload(rawPayload);
-        const deal = extractDeal(payload);
-        return new Response(JSON.stringify({ deal, row: dealToRow(deal) }, null, 2), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    return new Response("GHL Deal Ledger Worker v2. POST to /webhook (GHL) or /pandadoc-webhook (PandaDoc).", { status: 200 });
+    return new Response("Leo Deal Ledger Worker. POST Leo's outgoing webhook to /webhook (use /test to preview the row without writing).", { status: 200 });
   },
 };
