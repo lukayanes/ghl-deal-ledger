@@ -1,11 +1,16 @@
 /**
  * Leo Deal Ledger Worker — Google Sheets Edition
  *
- * Receives Leo's outgoing webhook when a deal goes under contract and inserts a
- * new row at row 4 (top of data) of the Summit Group Deal Ledger on Google Sheets.
+ * Leo is the source of truth for the Deal Ledger on Google Sheets.
+ *   - New deal goes under contract  -> inserts a row (newest on top).
+ *   - Deal already on the ledger    -> updates ONLY its Deal Status cell.
+ * Status buckets written: "Under Contract" (transaction board / UC stage),
+ * "Closed - Won" (Closed board), "Closed - Lost" (Dead board or Cancelled stage).
+ * "Listed/Posted" is manual and is never overwritten, nor is any other cell
+ * (Reason Lost, Amount in Escrow, Final Profit stay as you set them).
+ * Rows are matched on the Leo deal id written into Notes, or on seller name + street.
  * Leo's webhook body = { event, delivered_at, lead, contact, phones, stage, board, owners, money, ... }
- * (the same body as GET /v1/leads/:id). Deals already in the ledger (matched on the Leo
- * deal id written into Notes, or on seller name + street) are skipped.
+ * (the same body as GET /v1/leads/:id).
  *
  * ZERO external dependencies — deploys as a single file.
  *
@@ -209,33 +214,81 @@ function extractLeoDeal(body) {
   };
 }
 
-// Is this webhook a deal going under contract? (Leo's transaction board, or the Active board's pre-dispo UC stage)
-function isUnderContractEvent(body) {
+// Map a Leo webhook to one of the ledger's 4 Deal Status buckets.
+// Returns "Under Contract" | "Closed - Won" | "Closed - Lost", or null when the
+// stage isn't relevant to the ledger. "Listed/Posted" is never set here — it's manual.
+function statusFromLeo(body) {
   const boardKind = clean(body.board && body.board.kind).toLowerCase();
   const stageSlug = clean(body.stage && body.stage.slug).toLowerCase();
   const stageName = clean(body.stage && body.stage.name).toLowerCase();
-  if (boardKind === "transaction") return true;
-  if (stageSlug.includes("under_contract") || stageName.includes("under contract")) return true;
+
+  if (boardKind === "closed") return "Closed - Won";
+  if (boardKind === "dead") return "Closed - Lost";
+  if (boardKind === "cancelled") {
+    // Only the actual "Cancelled" stage is a loss; Stuck / Resolved Soon / Memorandum / Lawsuit stay as-is.
+    if (stageSlug === "cancelled" || stageName === "cancelled") return "Closed - Lost";
+    return null;
+  }
+  if (boardKind === "transaction") return "Under Contract";
+  if (stageSlug.includes("under_contract") || stageName.includes("under contract")) return "Under Contract";
+  return null;
+}
+
+// Decide whether to write a new status over the current cell.
+// Terminal states (Won/Lost) always win — Leo is source of truth for closing/losing.
+// "Under Contract" is only written onto a blank or already-"Under Contract" cell, so a
+// manually-set "Listed/Posted" (or an existing closed state) is never knocked backwards.
+function shouldWriteStatus(current, next) {
+  current = clean(current);
+  if (!next || next === current) return false;
+  if (next === "Closed - Won" || next === "Closed - Lost") return true;
+  if (next === "Under Contract") return current === "" || current === "Under Contract";
   return false;
 }
 
-// ─── Duplicate check against the sheet (Leo id in Notes, or seller + street) ─
+// ─── Find an existing ledger row (Leo id in Notes, or seller + street) ───────
+// Returns { rowNumber, currentStatus, matchedBy } for the matching sheet row, or null.
 
-async function alreadyInLedger(env, deal) {
+async function findLedgerRow(env, deal) {
   const token = await getGoogleAccessToken(env);
   const sheetName = env.SHEET_NAME || "Deal Ledger";
-  const res = await fetch("https://sheets.googleapis.com/v4/spreadsheets/" + env.SPREADSHEET_ID + "/values/" + encodeURIComponent("'" + sheetName + "'!A4:M"), { headers: { Authorization: "Bearer " + token } });
-  if (!res.ok) return false;   // if we cannot read, do not block the insert
+  const dataRow = parseInt(env.FIRST_DATA_ROW, 10) || 4;
+  const res = await fetch("https://sheets.googleapis.com/v4/spreadsheets/" + env.SPREADSHEET_ID + "/values/" + encodeURIComponent("'" + sheetName + "'!A" + dataRow + ":M"), { headers: { Authorization: "Bearer " + token } });
+  if (!res.ok) return null;   // if we cannot read, don't block an insert
   const rows = (await res.json()).values || [];
   const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const street = norm((deal.propertyAddress || "").split(",")[0]);
   const name = norm(deal.dealId);
-  for (const r of rows) {
-    const notes = String(r[12] || "");   // Notes is column M (index 12)
-    if (deal.leoId && notes.includes("Leo:" + deal.leoId)) return "leo id";
-    if (name && norm(r[0]) === name && street && norm(r[1]).startsWith(street)) return "name + street";
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const notes = String(r[12] || "");           // Notes = column M (index 12)
+    const idMatch = deal.leoId && notes.includes("Leo:" + deal.leoId);
+    const nameStreetMatch = name && norm(r[0]) === name && street && norm(r[1]).startsWith(street);
+    if (idMatch || nameStreetMatch) {
+      return { rowNumber: dataRow + i, currentStatus: String(r[3] || ""), matchedBy: idMatch ? "leo id" : "name + street" };
+    }
   }
-  return false;
+  return null;
+}
+
+// Update just the Deal Status cell (column D) of one row — leaves every other cell untouched.
+async function updateStatusCell(env, rowNumber, status) {
+  const token = await getGoogleAccessToken(env);
+  const sheetName = env.SHEET_NAME || "Deal Ledger";
+  const range = "'" + sheetName + "'!D" + rowNumber;
+  const res = await fetch(
+    "https://sheets.googleapis.com/v4/spreadsheets/" + env.SPREADSHEET_ID + "/values/" + encodeURIComponent(range) + "?valueInputOption=USER_ENTERED",
+    {
+      method: "PUT",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ values: [[status]] }),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error("Sheets status update failed (" + res.status + "): " + text);
+  }
+  return true;
 }
 
 // ─── Row Builder ─────────────────────────────────────────────────────────────
@@ -345,17 +398,31 @@ export default {
         const body = await request.json();
         if (!body || !body.lead) return json({ error: "Expected a Leo webhook body with a lead object", keys: Object.keys(body || {}) }, 400);
         const deal = extractLeoDeal(body);
-        const underContract = isUnderContractEvent(body);
+        const status = statusFromLeo(body);     // "Under Contract" | "Closed - Won" | "Closed - Lost" | null
+        if (status) deal.dealStatus = status;   // used when we insert a brand-new row
         const force = url.searchParams.get("force") === "1";
 
-        if (url.pathname === "/test") return json({ event: body.event, underContract, deal, row: dealToRow(deal) });
+        if (url.pathname === "/test") return json({ event: body.event, status, deal, row: dealToRow(deal) });
 
-        if (!underContract && !force) return json({ skipped: true, reason: "not an under-contract stage", event: body.event, stage: body.stage && body.stage.name, board: body.board && body.board.kind });
-        const dup = await alreadyInLedger(env, deal);
-        if (dup && !force) return json({ skipped: true, reason: "already in ledger (" + dup + ")", deal: deal.dealId });
+        // Is this deal already on the ledger? (match on Leo id, or seller + street)
+        const existing = await findLedgerRow(env, deal);
+
+        if (existing) {
+          // UPDATE path — Leo is source of truth for status changes. Only the Deal Status
+          // cell is touched; manual columns (Reason Lost, Escrow, Final Profit, a hand-set
+          // Listed/Posted) are never overwritten.
+          if (status && (shouldWriteStatus(existing.currentStatus, status) || force)) {
+            await updateStatusCell(env, existing.rowNumber, status);
+            return json({ updated: true, deal: deal.dealId, row: existing.rowNumber, from: existing.currentStatus, to: status, matchedBy: existing.matchedBy, event: body.event });
+          }
+          return json({ skipped: true, reason: "no status change", deal: deal.dealId, current: existing.currentStatus, wouldSet: status, matchedBy: existing.matchedBy });
+        }
+
+        // INSERT path — not on the ledger yet.
+        if (!status && !force) return json({ skipped: true, reason: "not a ledger-relevant stage", event: body.event, stage: body.stage && body.stage.name, board: body.board && body.board.kind });
 
         const result = await writeToLedger(env, deal);
-        return json(Object.assign({ event: body.event }, result));
+        return json(Object.assign({ event: body.event, status: deal.dealStatus }, result));
       } catch (err) {
         console.error("Webhook error: " + err.message);
         return json({ error: err.message }, 500);
