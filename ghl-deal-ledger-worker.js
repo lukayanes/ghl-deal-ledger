@@ -265,28 +265,33 @@ async function findLedgerRow(env, deal) {
     const idMatch = deal.leoId && notes.includes("Leo:" + deal.leoId);
     const nameStreetMatch = name && norm(r[0]) === name && street && norm(r[1]).startsWith(street);
     if (idMatch || nameStreetMatch) {
-      return { rowNumber: dataRow + i, currentStatus: String(r[3] || ""), matchedBy: idMatch ? "leo id" : "name + street" };
+      return { rowNumber: dataRow + i, currentStatus: String(r[3] || ""), currentCloseDate: String(r[8] || ""), currentContractPrice: String(r[9] || ""), matchedBy: idMatch ? "leo id" : "name + street" };
     }
   }
   return null;
 }
 
-// Update just the Deal Status cell (column D) of one row — leaves every other cell untouched.
-async function updateStatusCell(env, rowNumber, status) {
+// Update specific cells of one row — leaves every other cell untouched.
+// cellMap maps a column letter to a value, e.g. { D: "Closed - Won", I: "12/1/2026" }.
+async function updateRowCells(env, rowNumber, cellMap) {
+  const cols = Object.keys(cellMap);
+  if (cols.length === 0) return true;
   const token = await getGoogleAccessToken(env);
   const sheetName = env.SHEET_NAME || "Deal Ledger";
-  const range = "'" + sheetName + "'!D" + rowNumber;
+  const data = cols.map(function (col) {
+    return { range: "'" + sheetName + "'!" + col + rowNumber, values: [[cellMap[col]]] };
+  });
   const res = await fetch(
-    "https://sheets.googleapis.com/v4/spreadsheets/" + env.SPREADSHEET_ID + "/values/" + encodeURIComponent(range) + "?valueInputOption=USER_ENTERED",
+    "https://sheets.googleapis.com/v4/spreadsheets/" + env.SPREADSHEET_ID + "/values:batchUpdate",
     {
-      method: "PUT",
+      method: "POST",
       headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-      body: JSON.stringify({ values: [[status]] }),
+      body: JSON.stringify({ valueInputOption: "USER_ENTERED", data: data }),
     }
   );
   if (!res.ok) {
     const text = await res.text();
-    throw new Error("Sheets status update failed (" + res.status + "): " + text);
+    throw new Error("Sheets cell update failed (" + res.status + "): " + text);
   }
   return true;
 }
@@ -408,14 +413,19 @@ export default {
         const existing = await findLedgerRow(env, deal);
 
         if (existing) {
-          // UPDATE path — Leo is source of truth for status changes. Only the Deal Status
-          // cell is touched; manual columns (Reason Lost, Escrow, Final Profit, a hand-set
-          // Listed/Posted) are never overwritten.
-          if (status && (shouldWriteStatus(existing.currentStatus, status) || force)) {
-            await updateStatusCell(env, existing.rowNumber, status);
-            return json({ updated: true, deal: deal.dealId, row: existing.rowNumber, from: existing.currentStatus, to: status, matchedBy: existing.matchedBy, event: body.event });
+          // UPDATE path — Leo is source of truth. We re-sync Deal Status (D), Close Date (I)
+          // and Contract Price (J) from Leo each time. Manual columns (Reason Lost, Amount in
+          // Escrow, Final Profit, a hand-set Listed/Posted) are never overwritten.
+          const changes = {};
+          if (status && (shouldWriteStatus(existing.currentStatus, status) || force)) changes["D"] = status;
+          if (deal.closeDateActualEst && deal.closeDateActualEst !== existing.currentCloseDate) changes["I"] = deal.closeDateActualEst;
+          if (deal.contractPrice && deal.contractPrice !== existing.currentContractPrice) changes["J"] = deal.contractPrice;
+
+          if (Object.keys(changes).length) {
+            await updateRowCells(env, existing.rowNumber, changes);
+            return json({ updated: true, deal: deal.dealId, row: existing.rowNumber, changes: changes, matchedBy: existing.matchedBy, event: body.event });
           }
-          return json({ skipped: true, reason: "no status change", deal: deal.dealId, current: existing.currentStatus, wouldSet: status, matchedBy: existing.matchedBy });
+          return json({ skipped: true, reason: "no changes", deal: deal.dealId, current: existing.currentStatus, wouldSet: status, matchedBy: existing.matchedBy });
         }
 
         // INSERT path — not on the ledger yet.
